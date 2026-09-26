@@ -287,6 +287,7 @@ private:
     const llama_model & model;
 
     llama_cparams cparams;
+    bool moe_cache_enabled = false;
 
     llama_adapter_cvec_ptr  cvec;
     llama_adapter_loras_ptr loras;

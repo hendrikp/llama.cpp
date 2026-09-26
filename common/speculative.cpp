@@ -2471,6 +2471,7 @@ common_params common_base_params_to_speculative(const common_params & params) {
 
     result.embedding    = false;
     result.pooling_type = LLAMA_POOLING_TYPE_UNSPECIFIED;
+    result.n_moe_cache_slots = 0;
 
     if (has_draft) {
         // default to global devices value

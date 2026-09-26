@@ -6,6 +6,7 @@
 #include "ggml.h"
 #include "ggml-backend.h"
 
+#include <algorithm>
 #include <cinttypes>
 #include <condition_variable>
 #include <cstdlib>
@@ -29,6 +30,8 @@ struct layer_state {
     std::vector<int32_t>  pending;       // uncached ids observed since last step (dedup, obs order)
 
     std::vector<bool>     slot_in_flight; // slot has an upload pending
+    int32_t               n_growing = 0;   // in-flight uploads that add rather
+                                           // than replace a live entry
 
     uint64_t n_hit  = 0;
     uint64_t n_miss = 0;
@@ -37,13 +40,15 @@ struct layer_state {
 struct upload_job {
     size_t  layer_idx;
     int32_t expert;
-    int32_t slot;
+    int32_t slot;        // staging slot the upload lands in
+    int32_t victim_slot; // slot retired once the upload is published, -1 if none
     bool    done = false;
 };
 
 struct moe_cache {
     int32_t n_slots     = 0;
     int32_t max_inserts = 2;
+    int32_t n_spare     = 2; // slots held empty as upload staging area
 
     uint64_t clock   = 0;
     uint64_t n_steps = 0;
@@ -151,12 +156,15 @@ void llama_moe_cache_init(const llama_model & model, int32_t n_slots, int32_t ma
     }
     [&]() {
         if (n_slots <= 0) {
-            g_init_done = true;
             return;
         }
 
         auto * mc = new moe_cache();
         mc->n_slots = n_slots;
+        if (const char * e = getenv("LLAMA_MOE_CACHE_SPARE")) {
+            mc->n_spare = atoi(e);
+        }
+        mc->n_spare = n_slots == 1 ? 0 : std::max(1, std::min(mc->n_spare, n_slots - 1));
         if (max_inserts > 0) {
             mc->max_inserts = max_inserts;
         }
@@ -314,8 +322,8 @@ void llama_moe_cache_init(const llama_model & model, int32_t n_slots, int32_t ma
         g_cache = mc;
         g_init_done = true;
 
-        LLAMA_LOG_INFO("%s: MoE expert cache enabled: %zu layers x %d slots, %d inserts/step, %.1f MiB device memory\n",
-                __func__, mc->layers.size(), n_slots, mc->max_inserts, vram/1024.0/1024.0);
+        LLAMA_LOG_INFO("%s: MoE expert cache enabled: %zu layers x %d slots (%d staging), %d inserts/step, %.1f MiB device memory\n",
+                __func__, mc->layers.size(), n_slots, mc->n_spare, mc->max_inserts, vram/1024.0/1024.0);
     }();
 }
 
@@ -342,11 +350,29 @@ void llama_moe_cache_step() {
         std::lock_guard<std::mutex> lk(mc->mtx);
         for (const auto & j : mc->done) {
             auto & ls = mc->layers[j.layer_idx];
+
+            // the upload landed in a staging slot, so the replacement is fully
+            // resident and can be published at once; only then is the victim
+            // retired. the victim stayed readable for the entire transfer,
+            // which is what keeps live capacity equal to n_slots - n_spare
+            // instead of collapsing to zero while uploads are outstanding.
             ls.slot_expert[j.slot]     = j.expert;
             ls.expert_slot[j.expert]   = j.slot;
             ls.slot_last_use[j.slot]   = ++mc->clock;
             ls.slot_in_flight[j.slot]  = false;
             set_table_entry(ls.pub, j.expert, j.slot);
+
+            if (j.victim_slot >= 0) {
+                const int32_t victim = ls.slot_expert[j.victim_slot];
+                if (victim >= 0) {
+                    ls.expert_slot[victim] = -1;
+                    set_table_entry(ls.pub, victim, mc->n_slots);
+                }
+                ls.slot_expert[j.victim_slot]    = -1; // becomes the next staging slot
+                ls.slot_in_flight[j.victim_slot] = false;
+            } else {
+                ls.n_growing--;
+            }
         }
         mc->done.clear();
     }
@@ -354,8 +380,10 @@ void llama_moe_cache_step() {
     std::lock_guard<std::mutex> lock(mc->mtx);
     mc->n_steps++;
 
-    // 2) schedule new uploads: evict at a sync point (clear the victim's table
-    //    entry now), then hand the slice copies to the worker
+    // 2) schedule new uploads into a staging slot. nothing live is disturbed:
+    //    the victim keeps serving until its replacement has fully landed, and
+    //    the number of empty staging slots caps how many uploads can be in
+    //    flight at once, which is what bounds the queue.
     for (size_t li = 0; li < mc->layers.size(); ++li) {
         auto & ls = mc->layers[li];
         if (ls.pending.empty()) {
@@ -363,36 +391,55 @@ void llama_moe_cache_step() {
         }
 
         int budget = mc->max_inserts;
-        for (auto it = ls.pending.rbegin(); it != ls.pending.rend() && budget > 0; ++it, --budget) {
+        for (auto it = ls.pending.rbegin(); it != ls.pending.rend() && budget > 0; ++it) {
             const int32_t id = *it;
-            if (ls.expert_slot[id] >= 0) {
-                continue;
+            if (ls.expert_slot[id] != -1) {
+                continue; // already cached, or an upload for it is in flight
             }
 
-            // victim: an empty non-in-flight slot if any, else the LRU non-in-flight slot
-            int32_t slot = -1;
-            uint64_t best = UINT64_MAX;
+            // staging slot: empty and not already receiving an upload
+            int32_t stage = -1;
             for (int32_t s = 0; s < mc->n_slots; ++s) {
-                if (ls.slot_in_flight[s]) {
-                    continue;
-                }
-                if (ls.slot_expert[s] < 0) { slot = s; break; }
-                if (ls.slot_last_use[s] < best) { best = ls.slot_last_use[s]; slot = s; }
+                if (ls.slot_expert[s] < 0 && !ls.slot_in_flight[s]) { stage = s; break; }
             }
-            if (slot < 0) {
-                break; // every slot is in flight; try again next step
+            if (stage < 0) {
+                break; // no staging capacity this step; try again next step
             }
 
-            const int32_t victim = ls.slot_expert[slot];
-            if (victim >= 0) {
-                ls.expert_slot[victim] = -1;
-                ls.slot_expert[slot]   = -1;
-                set_table_entry(ls.pub, victim, mc->n_slots);
+            int32_t n_live = 0;
+            for (int32_t s = 0; s < mc->n_slots; ++s) {
+                if (ls.slot_expert[s] >= 0) { n_live++; }
             }
-            ls.slot_in_flight[slot] = true;
+
+            // only displace something once the cache is full to its live
+            // budget. in-flight uploads that add rather than replace an entry
+            // count toward that budget, otherwise warm-up fills every slot and
+            // leaves no staging capacity, freezing the cache permanently.
+            int32_t victim_slot = -1;
+            if (n_live + ls.n_growing >= mc->n_slots - mc->n_spare) {
+                uint64_t best = UINT64_MAX;
+                for (int32_t s = 0; s < mc->n_slots; ++s) {
+                    if (ls.slot_in_flight[s] || ls.slot_expert[s] < 0) {
+                        continue;
+                    }
+                    if (ls.slot_last_use[s] < best) { best = ls.slot_last_use[s]; victim_slot = s; }
+                }
+                if (victim_slot < 0) {
+                    break; // everything live is already spoken for
+                }
+                // reserve it so a later job this step cannot pick it too
+                ls.slot_in_flight[victim_slot] = true;
+            }
+
+            if (victim_slot < 0) {
+                ls.n_growing++;
+            }
+            ls.slot_in_flight[stage] = true;
+            ls.expert_slot[id]       = -2; // in flight: still a miss, but don't re-queue
 
             std::lock_guard<std::mutex> wlk(mc->wmtx);
-            mc->todo.push_back({li, id, slot});
+            mc->todo.push_back({li, id, stage, victim_slot});
+            --budget;
         }
         ls.pending.clear();
     }

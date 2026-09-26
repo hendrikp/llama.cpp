@@ -95,6 +95,7 @@ llama_context::llama_context(
     LLAMA_LOG_INFO("%s: constructing llama_context\n", __func__);
 
     llama_moe_cache_init(model, params.n_moe_cache_slots, params.n_moe_cache_inserts);
+    moe_cache_enabled = params.n_moe_cache_slots > 0;
 
     t_start_us = model.t_start_us;
     t_load_us  = model.t_load_us;
@@ -2094,7 +2095,10 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     //synchronize();
 
     // apply throttled MoE expert-cache updates between graph executions
-    llama_moe_cache_step();
+    if (moe_cache_enabled) {
+        synchronize();
+        llama_moe_cache_step();
+    }
 
     return 0;
 }
