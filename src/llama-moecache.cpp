@@ -84,7 +84,7 @@ void moe_obs_cb(const char * name, const struct ggml_tensor * ids, void * ud) {
 
     const int64_t n_ids    = ids->ne[0];
     const int64_t n_tokens = ids->ne[1];
-    if (n_tokens > 4) {
+    if (n_tokens > LLAMA_MOE_CACHE_MAX_BATCH) {
         return; // batch/prefill: the cache graph is not built there, don't pollute the LRU
     }
 
@@ -401,7 +401,7 @@ void llama_moe_cache_step() {
     if (mc->n_steps % 512 == 0) {
         uint64_t h = 0, m = 0;
         for (auto & ls : mc->layers) { h += ls.n_hit; m += ls.n_miss; }
-        LLAMA_LOG_DEBUG("moe-cache: steps=%" PRIu64 " hits=%" PRIu64 " misses=%" PRIu64 " hit-rate=%.1f%%\n",
+        LLAMA_LOG_INFO("moe-cache: steps=%" PRIu64 " hits=%" PRIu64 " misses=%" PRIu64 " hit-rate=%.1f%%\n",
                 mc->n_steps, h, m, h + m ? 100.0*h/(h + m) : 0.0);
     }
 }

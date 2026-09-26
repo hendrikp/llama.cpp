@@ -27,6 +27,9 @@
 
 #include <cstdint>
 
+// CUDA quantized MUL_MAT_ID is duplicate-safe within the vector-kernel window.
+#define LLAMA_MOE_CACHE_MAX_BATCH 8
+
 struct llama_model;
 struct ggml_tensor;
 
