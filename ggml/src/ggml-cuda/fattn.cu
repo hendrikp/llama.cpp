@@ -1677,9 +1677,6 @@ bool ggml_cuda_kv_stream_graph_add_attention(
             !ggml_cuda_flash_attn_ext_streamed_supported(dst, ring->page_bytes)) {
         return false;
     }
-    if (kv_stream_sparse_decode(dst)) {
-        return false;
-    }
     if (ring->graph_resident_cache != nullptr && ring->graph_resident_cache != resident_cache) {
         return false;
     }
@@ -1715,6 +1712,10 @@ bool ggml_cuda_kv_stream_graph_add_attention(
     resident_cache->mirror_by_data[K->data] = layer_base;
     resident_cache->mirror_by_data[V->data] = layer_base +
         size_t(resident_cache->layer_pages[resident_layer])*K->nb[1]*resident_cache->page_tokens;
+
+    if (kv_stream_sparse_decode(dst)) {
+        return true;
+    }
 
     const int64_t block_tokens = resident_cache->page_tokens;
     const int nchunks = int((K->ne[1] + block_tokens - 1)/block_tokens);
@@ -1808,13 +1809,18 @@ uint32_t ggml_cuda_kv_stream_last_ring_peak_occupancy(
 static __global__ void kv_stream_gather_sparse_rows(
         const char * k, const char * v, const half * mask, const int32_t * indices,
         char * out_k, char * out_v, half * out_mask,
-        size_t k_stride, size_t v_stride, int n_tokens) {
+        size_t k_stride, size_t v_stride, int n_tokens,
+        const char * resident_k, const char * resident_v, int64_t resident_tokens) {
     ggml_cuda_pdl_sync();
     const int row = blockIdx.x;
     if (row >= n_tokens) {
         return;
     }
     const int32_t token = indices[row];
+    if (token >= 0 && token < resident_tokens) {
+        k = resident_k;
+        v = resident_v;
+    }
     for (size_t i = threadIdx.x; i < k_stride; i += blockDim.x) {
         out_k[row*k_stride + i] = token >= 0 ? k[size_t(token)*k_stride + i] : 0;
     }
@@ -1827,10 +1833,47 @@ static __global__ void kv_stream_gather_sparse_rows(
     ggml_cuda_pdl_lc();
 }
 
-static void kv_stream_sparse_attention(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+static void kv_stream_sparse_attention(
+        ggml_backend_cuda_context & ctx, ggml_tensor * dst,
+        ggml_cuda_kv_stream_transfer_ring * ring,
+        ggml_cuda_kv_stream_resident_cache * cache) {
     const ggml_tensor * k = dst->src[1];
     const ggml_tensor * v = dst->src[2];
     const ggml_tensor * mask = dst->src[3];
+    char * resident_k = nullptr;
+    char * resident_v = nullptr;
+    int64_t resident_tokens = 0;
+    if (cache != nullptr) {
+        const uint32_t layer = kv_stream_resident_layer(cache, k->data);
+        const uint32_t pages = std::min<uint32_t>(cache->layer_pages[layer], k->ne[1]/cache->page_tokens);
+        resident_k = cache->pool_data + cache->scratch_bytes + cache->layer_offsets[layer]*cache->page_bytes;
+        resident_v = resident_k + size_t(cache->layer_pages[layer])*cache->page_tokens*k->nb[1];
+        resident_tokens = int64_t(pages)*cache->page_tokens;
+        for (uint32_t page = 0; page < pages; ++page) {
+            const size_t index = kv_stream_resident_index(cache, layer, page);
+            const bool loaded = cache->loaded[index] != 0;
+            if (loaded) {
+                ++cache->stats.resident_hits;
+            } else {
+                ++cache->stats.resident_misses;
+            }
+            const bool refresh = !loaded || !cache->precise_dirty_tracking[layer] || cache->dirty[index];
+            if (!refresh) {
+                continue;
+            }
+            const size_t first = size_t(page)*cache->page_tokens;
+            const size_t k_bytes = size_t(cache->page_tokens)*k->nb[1];
+            const size_t v_bytes = size_t(cache->page_tokens)*v->nb[1];
+            CUDA_CHECK(cudaMemcpyAsync(resident_k + first*k->nb[1],
+                static_cast<const char *>(k->data) + first*k->nb[1], k_bytes, cudaMemcpyHostToDevice, ctx.stream()));
+            CUDA_CHECK(cudaMemcpyAsync(resident_v + first*v->nb[1],
+                static_cast<const char *>(v->data) + first*v->nb[1], v_bytes, cudaMemcpyHostToDevice, ctx.stream()));
+            cache->loaded[index] = 1;
+            cache->dirty[index] = 0;
+            cache->stats.host_to_device_bytes += k_bytes + v_bytes;
+            ring->host_to_device_copy_commands += 2;
+        }
+    }
     const int32_t n_tokens = GGML_PAD(ggml_get_op_params_i32(dst, 4), FATTN_KQ_STRIDE);
     ggml_cuda_pool_alloc<int32_t> indices(ctx.pool(), n_tokens + 1);
     ggml_cuda_pool_alloc<char> compact_k(ctx.pool(), size_t(n_tokens)*k->nb[1]);
@@ -1846,7 +1889,7 @@ static void kv_stream_sparse_attention(ggml_backend_cuda_context & ctx, ggml_ten
     ggml_cuda_kernel_launch(kv_stream_gather_sparse_rows, launch_params,
         static_cast<const char *>(attr_k.devicePointer), static_cast<const char *>(attr_v.devicePointer),
         static_cast<const half *>(mask->data), indices.ptr, compact_k.ptr, compact_v.ptr, compact_mask.ptr,
-        k->nb[1], v->nb[1], n_tokens);
+        k->nb[1], v->nb[1], n_tokens, resident_k, resident_v, resident_tokens);
     CUDA_CHECK(cudaGetLastError());
 
     ggml_tensor selected_k = *k;
@@ -1880,7 +1923,7 @@ void ggml_cuda_flash_attn_ext_streamed(
     GGML_ASSERT(ggml_cuda_flash_attn_ext_streamed_supported(dst, stage_bytes));
 
     if (kv_stream_sparse_decode(dst)) {
-        kv_stream_sparse_attention(ctx, dst);
+        kv_stream_sparse_attention(ctx, dst, transfer_ring, resident_cache);
         return;
     }
 

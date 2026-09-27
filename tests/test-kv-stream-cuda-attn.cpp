@@ -131,7 +131,8 @@ std::vector<float> run_attention(
         bool change_indices = false,
         bool replace_cache = false,
         uint64_t graph_uid = 0,
-        int32_t n_kv_max = 0) {
+        int32_t n_kv_max = 0,
+        bool change_resident_layout = false) {
     constexpr size_t N_TENSORS = 32;
     const size_t context_bytes = ggml_tensor_overhead()*N_TENSORS + ggml_graph_overhead_custom(N_TENSORS, false);
 
@@ -229,6 +230,12 @@ std::vector<float> run_attention(
     }
     GGML_ASSERT(ggml_backend_supports_op(backend, out));
     for (int repeat = 0; repeat < repeats; ++repeat) {
+        if (change_resident_layout && dirty_runtime != nullptr && (repeat == 1 || repeat == 2)) {
+            ggml_backend_synchronize(backend);
+            GGML_ASSERT(ggml_backend_cuda_graph_reset(backend));
+            GGML_ASSERT(ggml_backend_cuda_kv_stream_set_decode_layout(
+                dirty_runtime, repeat == 1 ? 2 : uint32_t(n_kv/256)));
+        }
         if (replace_cache && repeat == 3) {
             std::vector<uint8_t> zero_k(inputs.k.size(), 0);
             std::vector<uint8_t> zero_v(inputs.v.size(), 0);
@@ -427,31 +434,55 @@ int main() {
                     }
                 }
             }
-            const auto expected = run_attention(backend.get(), inputs,
-                ggml_backend_get_default_buffer_type(backend.get()), n_kv, n_batch, 2, 1, true, GGML_TYPE_I32, true, nullptr, false, false, 0, 1024);
-            ggml_backend_cuda_kv_stream_params params{};
-            params.device = 0;
-            params.stage_bytes = 2*ggml_row_size(GGML_TYPE_Q8_0, HEAD_DIM)*N_KV_HEAD*256;
-            params.stage_slots = 2;
-            auto runtime = ggml_backend_cuda_kv_stream_runtime_new(params);
-            if (!t.assert_true("stream runtime initializes", runtime != nullptr)) {
-                break;
+            for (int resident_pages : {0, 2, 1024}) {
+                for (bool replace_cache : {false, true}) {
+                    const auto expected = run_attention(backend.get(), inputs,
+                        ggml_backend_get_default_buffer_type(backend.get()), n_kv, n_batch,
+                        4, 1, n_batch == 1, GGML_TYPE_I64, false, nullptr, true, replace_cache, 0, 1024);
+                    ggml_backend_cuda_kv_stream_params params{};
+                    params.device = 0;
+                    params.stage_bytes = 2*ggml_row_size(GGML_TYPE_Q8_0, HEAD_DIM)*N_KV_HEAD*256;
+                    params.stage_slots = 2;
+                    if (resident_pages > 0) {
+                        params.pool_bytes = size_t(resident_pages + params.stage_slots)*params.stage_bytes;
+                        params.resident_layer_count = 1;
+                        params.page_tokens = 256;
+                    }
+                    auto runtime = ggml_backend_cuda_kv_stream_runtime_new(params);
+                    if (!t.assert_true("stream runtime initializes", runtime != nullptr)) {
+                        break;
+                    }
+                    const auto actual = run_attention(backend.get(), inputs,
+                        ggml_backend_cuda_kv_stream_buffer_type(runtime), n_kv, n_batch,
+                        4, 1, n_batch == 1, GGML_TYPE_I64, false, resident_pages > 0 ? runtime : nullptr, true, replace_cache,
+                        9000 + resident_pages + int(replace_cache), 1024, resident_pages == 1024 && replace_cache);
+                    const auto stats = ggml_backend_cuda_kv_stream_get_stats(runtime);
+                    ggml_backend_cuda_kv_stream_runtime_free(runtime);
+                    if (n_batch == 1) {
+                        t.assert_equal(uint64_t(0), stats.asynchronous_page_uploads);
+                    }
+                    if (resident_pages > 0) {
+                        t.assert_true("resident KV pages are populated", stats.resident_misses > 0);
+                        if (n_batch == 1 && !replace_cache) {
+                            t.assert_equal(uint64_t(resident_pages), stats.resident_misses);
+                            t.assert_equal(uint64_t(resident_pages)*params.stage_bytes, stats.host_to_device_bytes);
+                        }
+                    }
+                    if (!t.assert_equal(expected.size(), actual.size())) {
+                        break;
+                    }
+                    float max_abs = 0.0f;
+                    bool finite = true;
+                    for (size_t i = 0; i < actual.size(); ++i) {
+                        finite = finite && std::isfinite(actual[i]) && std::isfinite(expected[i]);
+                        max_abs = std::max(max_abs, std::abs(expected[i] - actual[i]));
+                    }
+                    std::fprintf(stderr, "sparse batch=%lld resident=%d replace=%d max_abs=%g uploads=%llu bytes=%llu\n",
+                        (long long) n_batch, resident_pages, int(replace_cache), max_abs,
+                        (unsigned long long) stats.resident_misses, (unsigned long long) stats.host_to_device_bytes);
+                    t.assert_true("sparse outputs are finite and equivalent", finite && max_abs <= 5e-4f);
+                }
             }
-            const auto actual = run_attention(backend.get(), inputs,
-                ggml_backend_cuda_kv_stream_buffer_type(runtime), n_kv, n_batch, 2, 1, true, GGML_TYPE_I32, true, nullptr, false, false, 0, 1024);
-            const auto stats = ggml_backend_cuda_kv_stream_get_stats(runtime);
-            ggml_backend_cuda_kv_stream_runtime_free(runtime);
-            t.assert_true("only prefill streams full pages", n_batch == 1 ? stats.asynchronous_page_uploads == 0 : stats.asynchronous_page_uploads > 0);
-            if (!t.assert_equal(expected.size(), actual.size())) {
-                break;
-            }
-            float max_abs = 0.0f;
-            bool finite = true;
-            for (size_t i = 0; i < actual.size(); ++i) {
-                finite = finite && std::isfinite(actual[i]) && std::isfinite(expected[i]);
-                max_abs = std::max(max_abs, std::abs(expected[i] - actual[i]));
-            }
-            t.assert_true("sparse outputs are finite and equivalent", finite && max_abs <= 5e-4f);
         }
         N_KV_HEAD = 4;
     });
