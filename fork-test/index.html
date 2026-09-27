@@ -1,0 +1,2641 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Qwen4Exp | Fork performance</title><link rel="stylesheet" href="style.css"></head>
+<body><main>
+<header><div class="eyebrow">Local inference / performance notebook</div><h1>Qwen4Exp fork performance</h1><p class="muted">Short parameter sweeps and sustained fiction-scifi generation, collected in one portable report.</p><div class="pills"><span class="pill">RTX 5080 / 16 GiB</span><span class="pill">Threadripper 2990WX / 16 available logical CPUs</span><span class="pill">127.9 GiB RAM</span><span class="pill">262,144 context capacity / Q8 KV</span><span class="pill">13 decode / 15 prefill threads</span></div></header>
+<div class="statline"><span id="counts"></span><a href="data.json" download>Download sanitized JSON</a></div>
+<div class="cards" id="cards"></div>
+<div class="note"><strong>Capacity is not populated context.</strong> Short tests use approximately 2.1K input tokens and 128 generated tokens. Fiction-scifi uses 305 input tokens and 20,480 generated tokens. Cold sustained-test prefill and warm short-test prefill are different measurements.</div>
+<section class="panel"><h2>Code checkpoints</h2><p class="caption">Source-state landmarks, not a claim that each benchmark binary was built from a clean commit. Configuration changes are separate from code changes.</p><div class="checkpoint-grid" id="checkpoints"></div></section>
+<section class="panel"><h2>Short sweep: prefill and decode</h2><p class="caption">CPU baseline, microbatch, expert-cache and MTP variants. Repeated configurations remain separate. Failed attempts are retained in the table below.</p><div class="toolbar"><label>Request phase <select id="phase"><option value="warm">Warm / second request</option><option value="cold">Cold / first request</option></select></label></div><div class="grid"><div><h3>Prefill throughput</h3><svg id="prefill" class="chart" role="img" aria-label="Short-test prefill throughput"></svg></div><div><h3>Decode throughput</h3><svg id="decode" class="chart" role="img" aria-label="Short-test decode throughput"></svg></div></div><p class="caption">Reference lines: 200 t/s prefill and 13 t/s decode. Hover or focus a bar for its exact value.</p></section>
+<section class="panel"><h2>Fiction-scifi: sustained decode</h2><p class="caption">Each point measures an approximately 1,024-token interval. Select variants in the legend; optionally show each run's single initial prefill measurement as a dashed reference.</p><div class="toolbar"><label><input type="checkbox" id="prefillRefs">Show initial prefill references</label><button id="allCurves">Show all variants</button><button id="compareCurves">Compare 54-slot implementations</button></div><div class="legend" id="legend"></div><svg id="sustained" class="chart" viewBox="0 0 1100 370" role="img" aria-label="Decode speed versus generated output tokens"></svg><div class="note" id="improvement"></div></section>
+<section class="panel"><h2>Resource usage and speed</h2><p class="caption">One point per successful variant. GPU memory is total-device peak, including background usage; RAM is peak process working set. Neither is a per-layer allocation breakdown.</p><div class="toolbar"><label>Memory metric <select id="memory"><option value="peak_gpu_used_mib">Peak GPU usage</option><option value="peak_process_rss_mib">Peak process RAM</option></select></label><label>Workload <select id="memorySuite"><option value="fiction-scifi">Fiction-scifi</option><option value="short">Short sweep</option></select></label></div><svg id="resources" class="chart" viewBox="0 0 1100 320" role="img" aria-label="Peak memory versus decode speed"></svg><p class="caption">Hover a point for the variant and exact measurements. Short-sweep points follow the request-phase selector above.</p></section>
+<section class="panel"><h2>All variants</h2><div class="toolbar"><label>Workload <select id="suite"><option value="all">Both workloads</option><option value="short">Short sweep</option><option value="fiction-scifi">Fiction-scifi</option></select></label><label>Find <input id="search" type="search" placeholder="CPU, MTP, resident, e54..."></label><span id="visibleCount" class="caption"></span></div><p class="caption">Memory peaks span the entire attempt, not just the selected request. Null measurements display as a dash. Slot counts include staging; resident expert counts are per layer. KV mode, MTP draft limit and checkpoint are shown with each variant.</p><div class="table-wrap"><table><thead><tr><th>Variant / checkpoint</th><th>Microbatch</th><th>Slots / resident</th><th>Inserts / staging</th><th>Arena MiB</th><th>Input / output</th><th>Prefill t/s</th><th>Decode t/s</th><th>Last interval t/s</th><th>Peak GPU GiB</th><th>Peak RAM GiB</th><th>Steady shared GiB</th><th>Expert hit %</th><th>Draft accepted %</th><th>Status</th></tr></thead><tbody id="rows"></tbody></table></div><p class="caption">WDDM shared memory includes mapped host tensors. A high absolute value does not establish VRAM spill. Draft acceptance is accepted draft tokens divided by proposed draft tokens.</p></section>
+<section class="panel"><h2>Reading the measurements</h2><ul id="notes"></ul><details><summary>What the JSON contains</summary><p class="caption">Hardware and source checkpoints; every recorded variant's numeric configuration; cold, warm and sustained timing summaries; peak and phase-level memory usage; expert-cache and MTP counts; and sustained decode intervals. No commands, filesystem paths, logs, prompts, model output, or raw event streams are included.</p></details></section>
+<footer>All charts are drawn locally. No network requests, external libraries, or fonts. The HTML embeds the same sanitized dataset as data.json so it can be opened directly from disk; keep style.css beside it.</footer>
+</main><script id="data" type="application/json">{
+  "schema_version": 1,
+  "title": "Qwen4Exp fork performance",
+  "hardware": {
+    "gpu": "NVIDIA GeForce RTX 5080",
+    "gpu_vram_gib": 16,
+    "cpu": "AMD Ryzen Threadripper 2990WX",
+    "available_logical_cpus": 16,
+    "ram_gib": 127.9,
+    "os": "Windows",
+    "model": "Qwen3.8-Flash-Next-176B-A6B",
+    "weights": "IQ4_XS",
+    "mtp_weights": "Q8_0"
+  },
+  "checkpoints": [
+    {
+      "id": "foundation",
+      "title": "Hot-expert and MTP foundation",
+      "hash": "80c7db2104d93b93b64ff20a397bcbacc2929a36",
+      "detail": "Local fork state before the adaptive-KV merge. Context only; no standalone timing row is attributed to this commit."
+    },
+    {
+      "id": "raymond",
+      "title": "Raymond Huang: shared phase arena",
+      "hash": "d7680c67b89f7cd4e3069b4bc2f26747aa588e3d",
+      "detail": "Imported adaptive KV streaming: host-backed KV, resident pages, and compute/KV arena repartition between prefill and decode."
+    },
+    {
+      "id": "integration",
+      "title": "Qwen4Exp streaming integration",
+      "hash": "00a8a8250fc1d2af89a8478211733c8d79d97923",
+      "detail": "Hybrid indexer integration, sparse host-row gathering, tiled prefill, and arena reservation handling. Code-state checkpoint for the short sweep and first six fiction-scifi variants."
+    },
+    {
+      "id": "resident",
+      "title": "Resident KV for sparse attention",
+      "hash": "ff0f7c03c471f61607aa1af47ab1b46b4d673af5",
+      "detail": "Sparse attention reads resident KV from VRAM, uses host fallback outside the resident prefix, and reuses mirrored writes and invalidation. Tested with the 54-slot / 1-insert / 1-staging fiction-scifi variant."
+    }
+  ],
+  "notes": [
+    "All runs configure 262144-token capacity and Q8_0 K/V. Actual inputs are about 2.1K tokens for short tests and 305 tokens for fiction-scifi; this is not full-256K throughput.",
+    "Short tests record a first request and a second request after startup. Warm means the second request; recorded prompt-cache reuse is zero. OS file-cache warmth is not controlled.",
+    "Fiction-scifi uses one fresh-server request and 20480 generated tokens. Its prefill measurement is a cold-start observation, not comparable to warm short-test prefill.",
+    "Identical prompts and sampling settings produced different generated sequences. The 54-slot host-gather and resident-KV runs first diverge at output token 1779. Single observations do not isolate every source of variation.",
+    "Peak GPU usage is total-device usage, including desktop and other allocations, sampled every two seconds across startup and inference. Brief spikes can be missed. CPU-only GPU usage is background device usage.",
+    "RAM usage is process working set (RSS), not virtual address space or total mappings. WDDM shared usage includes mapped host weights; its absolute value is not proof of VRAM spill.",
+    "Expert slot counts include staging. Resident experts per layer equal slots minus staging. Missing staging fields in older recordings use the verified default of two.",
+    "The microbatch 2048 and 4096 variants use an 8192 MiB arena; other streaming variants use 4000 MiB. Microbatch comparisons therefore also change arena size.",
+    "The first output token is excluded from decode interval deltas. Each sustained run has 20 intervals covering 20479 token-to-token steps.",
+    "Checkpoint hashes identify corresponding source states, not exact original binary identities. Early measurements used uncommitted integration work; later commits captured that work. Native and CPU runs used the same integration build with streaming disabled.",
+    "SSD throughput, pagefile residency, energy consumption, and full memory-allocation breakdowns were not recorded per variant. They are not inferred here.",
+    "These are throughput measurements. No generated text or quality score is included."
+  ],
+  "cases": [
+    {
+      "id": "cpu-u1024",
+      "suite": "short",
+      "status": "ok",
+      "checkpoint": "integration",
+      "config": {
+        "context": 262144,
+        "cache_k": "q8_0",
+        "cache_v": "q8_0",
+        "microbatch": 1024,
+        "batch": 8138,
+        "expert_slots": 0,
+        "expert_inserts": 2,
+        "arena_mib": 0,
+        "mtp_tokens": 0,
+        "cpu_only": true,
+        "threads": 13,
+        "threads_batch": 15,
+        "checkpoints": 32,
+        "kv_mode": "cpu",
+        "expert_staging": 0,
+        "resident_experts": 0,
+        "sparse_resident_kv": false
+      },
+      "measurements": [
+        {
+          "phase": "cold",
+          "cache_n": 0,
+          "prompt_n": 2117,
+          "prompt_ms": 123128.03,
+          "prompt_per_second": 17.193485512600176,
+          "predicted_n": 128,
+          "predicted_ms": 35592.759,
+          "predicted_per_second": 3.568141486306246
+        },
+        {
+          "phase": "warm",
+          "cache_n": 0,
+          "prompt_n": 2116,
+          "prompt_ms": 123329.269,
+          "prompt_per_second": 17.157322160078643,
+          "predicted_n": 128,
+          "predicted_ms": 34775.592,
+          "predicted_per_second": 3.651986715280074
+        }
+      ],
+      "usage": {
+        "peak_gpu_used_mib": 631,
+        "peak_process_rss_mib": 79520.2,
+        "peak_wddm_dedicated_mib": null,
+        "peak_wddm_shared_mib": null,
+        "memory_sampling_seconds": 2,
+        "startup_seconds": 29.59,
+        "elapsed_seconds": 351.16,
+        "memory_samples": 168,
+        "minimum_system_available_ram_mib": 43139.2,
+        "steady_wddm_shared_mib": null,
+        "phase_peaks": {
+          "cold": {
+            "gpu_used_mib": 631,
+            "process_rss_mib": 76624.6
+          },
+          "startup": {
+            "gpu_used_mib": 629,
+            "process_rss_mib": 47568.0
+          },
+          "warm": {
+            "gpu_used_mib": 631,
+            "process_rss_mib": 79520.2
+          }
+        }
+      },
+      "expert_cache": null,
+      "decode_intervals": []
+    },
+    {
+      "id": "native-u512-e16-mtp0",
+      "suite": "short",
+      "status": "ok",
+      "checkpoint": "integration",
+      "config": {
+        "context": 262144,
+        "cache_k": "q8_0",
+        "cache_v": "q8_0",
+        "microbatch": 512,
+        "batch": 8138,
+        "expert_slots": 16,
+        "expert_inserts": 2,
+        "arena_mib": 0,
+        "mtp_tokens": 0,
+        "cpu_only": false,
+        "threads": 13,
+        "threads_batch": 15,
+        "checkpoints": 32,
+        "kv_mode": "native",
+        "expert_staging": 2,
+        "resident_experts": 14,
+        "sparse_resident_kv": false
+      },
+      "measurements": [
+        {
+          "phase": "cold",
+          "cache_n": 0,
+          "prompt_n": 2117,
+          "prompt_ms": 37198.232,
+          "prompt_per_second": 56.91130696749243,
+          "predicted_n": 128,
+          "predicted_ms": 12232.739,
+          "predicted_per_second": 10.381975778278274
+        },
+        {
+          "phase": "warm",
+          "cache_n": 0,
+          "prompt_n": 2116,
+          "prompt_ms": 20745.658,
+          "prompt_per_second": 101.9972468455809,
+          "predicted_n": 128,
+          "predicted_ms": 12195.174,
+          "predicted_per_second": 10.413955553237697
+        }
+      ],
+      "usage": {
+        "peak_gpu_used_mib": 12757,
+        "peak_process_rss_mib": 63184.2,
+        "peak_wddm_dedicated_mib": null,
+        "peak_wddm_shared_mib": null,
+        "memory_sampling_seconds": 2,
+        "startup_seconds": 46.75,
+        "elapsed_seconds": 134.02,
+        "memory_samples": 63,
+        "minimum_system_available_ram_mib": 59393.5,
+        "steady_wddm_shared_mib": null,
+        "phase_peaks": {
+          "cold": {
+            "gpu_used_mib": 12755,
+            "process_rss_mib": 62805.5
+          },
+          "startup": {
+            "gpu_used_mib": 8920,
+            "process_rss_mib": 61611.6
+          },
+          "warm": {
+            "gpu_used_mib": 12757,
+            "process_rss_mib": 63184.2
+          }
+        }
+      },
+      "expert_cache": null,
+      "decode_intervals": []
+    },
+    {
+      "id": "native-u512-e16-mtp1",
+      "suite": "short",
+      "status": "ok",
+      "checkpoint": "integration",
+      "config": {
+        "context": 262144,
+        "cache_k": "q8_0",
+        "cache_v": "q8_0",
+        "microbatch": 512,
+        "batch": 8138,
+        "expert_slots": 16,
+        "expert_inserts": 2,
+        "arena_mib": 0,
+        "mtp_tokens": 1,
+        "cpu_only": false,
+        "threads": 13,
+        "threads_batch": 15,
+        "checkpoints": 32,
+        "kv_mode": "native",
+        "expert_staging": 2,
+        "resident_experts": 14,
+        "sparse_resident_kv": false
+      },
+      "measurements": [
+        {
+          "phase": "cold",
+          "cache_n": 0,
+          "prompt_n": 2117,
+          "prompt_ms": 40148.122,
+          "prompt_per_second": 52.72973913947954,
+          "predicted_n": 128,
+          "predicted_ms": 11521.542,
+          "predicted_per_second": 11.022830103817702,
+          "draft_n": 67,
+          "draft_n_accepted": 59
+        },
+        {
+          "phase": "warm",
+          "cache_n": 0,
+          "prompt_n": 2116,
+          "prompt_ms": 22546.369,
+          "prompt_per_second": 93.85103206640503,
+          "predicted_n": 128,
+          "predicted_ms": 11268.043,
+          "predicted_per_second": 11.270812509323935,
+          "draft_n": 68,
+          "draft_n_accepted": 58
+        }
+      ],
+      "usage": {
+        "peak_gpu_used_mib": 15809,
+        "peak_process_rss_mib": 67585.2,
+        "peak_wddm_dedicated_mib": null,
+        "peak_wddm_shared_mib": null,
+        "memory_sampling_seconds": 2,
+        "startup_seconds": 56.64,
+        "elapsed_seconds": 147.66,
+        "memory_samples": 70,
+        "minimum_system_available_ram_mib": 54964.6,
+        "steady_wddm_shared_mib": null,
+        "phase_peaks": {
+          "cold": {
+            "gpu_used_mib": 15807,
+            "process_rss_mib": 67201.2
+          },
+          "startup": {
+            "gpu_used_mib": 15764,
+            "process_rss_mib": 66118.2
+          },
+          "warm": {
+            "gpu_used_mib": 15809,
+            "process_rss_mib": 67585.2
+          }
+        }
+      },
+      "expert_cache": null,
+      "decode_intervals": []
+    },
+    {
+      "id": "native-u512-e16-mtp3",
+      "suite": "short",
+      "status": "ok",
+      "checkpoint": "integration",
+      "config": {
+        "context": 262144,
+        "cache_k": "q8_0",
+        "cache_v": "q8_0",
+        "microbatch": 512,
+        "batch": 8138,
+        "expert_slots": 16,
+        "expert_inserts": 2,
+        "arena_mib": 0,
+        "mtp_tokens": 3,
+        "cpu_only": false,
+        "threads": 13,
+        "threads_batch": 15,
+        "checkpoints": 32,
+        "kv_mode": "native",
+        "expert_staging": 2,
+        "resident_experts": 14,
+        "sparse_resident_kv": false
+      },
+      "measurements": [
+        {
+          "phase": "cold",
+          "cache_n": 0,
+          "prompt_n": 2117,
+          "prompt_ms": 40012.828,
+          "prompt_per_second": 52.90803239401124,
+          "predicted_n": 128,
+          "predicted_ms": 11146.289,
+          "predicted_per_second": 11.393926714083943,
+          "draft_n": 116,
+          "draft_n_accepted": 88
+        },
+        {
+          "phase": "warm",
+          "cache_n": 0,
+          "prompt_n": 2116,
+          "prompt_ms": 23453.579,
+          "prompt_per_second": 90.22077184893614,
+          "predicted_n": 128,
+          "predicted_ms": 11690.034,
+          "predicted_per_second": 10.863954715615026,
+          "draft_n": 125,
+          "draft_n_accepted": 85
+        }
+      ],
+      "usage": {
+        "peak_gpu_used_mib": 15801,
+        "peak_process_rss_mib": 67879.9,
+        "peak_wddm_dedicated_mib": null,
+        "peak_wddm_shared_mib": null,
+        "memory_sampling_seconds": 2,
+        "startup_seconds": 63.78,
+        "elapsed_seconds": 157.52,
+        "memory_samples": 74,
+        "minimum_system_available_ram_mib": 54711.5,
+        "steady_wddm_shared_mib": null,
+        "phase_peaks": {
+          "cold": {
+            "gpu_used_mib": 15801,
+            "process_rss_mib": 67475.3
+          },
+          "startup": {
+            "gpu_used_mib": 15755,
+            "process_rss_mib": 65899.0
+          },
+          "warm": {
+            "gpu_used_mib": 15801,
+            "process_rss_mib": 67879.9
+          }
+        }
+      },
+      "expert_cache": null,
+      "decode_intervals": []
+    },
+    {
+      "id": "stream-u1024-e16",
+      "suite": "short",
+      "status": "ok",
+      "checkpoint": "integration",
+      "config": {
+        "context": 262144,
+        "cache_k": "q8_0",
+        "cache_v": "q8_0",
+        "microbatch": 1024,
+        "batch": 8138,
+        "expert_slots": 16,
+        "expert_inserts": 2,
+        "arena_mib": 4000,
+        "mtp_tokens": 0,
+        "cpu_only": false,
+        "threads": 13,
+        "threads_batch": 15,
+        "checkpoints": 32,
+        "kv_mode": "streaming",
+        "expert_staging": 2,
+        "resident_experts": 14,
+        "sparse_resident_kv": false
+      },
+      "measurements": [
+        {
+          "phase": "cold",
+          "cache_n": 0,
+          "prompt_n": 2117,
+          "prompt_ms": 29776.088,
+          "prompt_per_second": 71.09731808960264,
+          "predicted_n": 128,
+          "predicted_ms": 14364.241,
+          "predicted_per_second": 8.841399973726423
+        },
+        {
+          "phase": "warm",
+          "cache_n": 0,
+          "prompt_n": 2116,
+          "prompt_ms": 14168.5,
+          "prompt_per_second": 149.34537883332746,
+          "predicted_n": 128,
+          "predicted_ms": 14722.147,
+          "predicted_per_second": 8.626459170663082
+        }
+      ],
+      "usage": {
+        "peak_gpu_used_mib": 11668,
+        "peak_process_rss_mib": 66724.3,
+        "peak_wddm_dedicated_mib": null,
+        "peak_wddm_shared_mib": null,
+        "memory_sampling_seconds": 2,
+        "startup_seconds": 49.67,
+        "elapsed_seconds": 128.19,
+        "memory_samples": 60,
+        "minimum_system_available_ram_mib": 55902.4,
+        "steady_wddm_shared_mib": null,
+        "phase_peaks": {
+          "cold": {
+            "gpu_used_mib": 11666,
+            "process_rss_mib": 66288.3
+          },
+          "startup": {
+            "gpu_used_mib": 11532,
+            "process_rss_mib": 65851.7
+          },
+          "warm": {
+            "gpu_used_mib": 11668,
+            "process_rss_mib": 66724.3
+          }
+        }
+      },
+      "expert_cache": null,
+      "decode_intervals": []
+    },
+    {
+      "id": "stream-u1024-e32",
+      "suite": "short",
+      "status": "ok",
+      "checkpoint": "integration",
+      "config": {
+        "context": 262144,
+        "cache_k": "q8_0",
+        "cache_v": "q8_0",
+        "microbatch": 1024,
+        "batch": 8138,
+        "expert_slots": 32,
+        "expert_inserts": 2,
+        "arena_mib": 4000,
+        "mtp_tokens": 0,
+        "cpu_only": false,
+        "threads": 13,
+        "threads_batch": 15,
+        "checkpoints": 32,
+        "kv_mode": "streaming",
+        "expert_staging": 2,
+        "resident_experts": 30,
+        "sparse_resident_kv": false
+      },
+      "measurements": [
+        {
+          "phase": "cold",
+          "cache_n": 0,
+          "prompt_n": 2117,
+          "prompt_ms": 29675.725,
+          "prompt_per_second": 71.33776849596767,
+          "predicted_n": 128,
+          "predicted_ms": 13719.069,
+          "predicted_per_second": 9.257187933087879
+        },
+        {
+          "phase": "warm",
+          "cache_n": 0,
+          "prompt_n": 2116,
+          "prompt_ms": 14085.149,
+          "prompt_per_second": 150.22915270544885,
+          "predicted_n": 128,
+          "predicted_ms": 13173.091,
+          "predicted_per_second": 9.6408656100531
+        }
+      ],
+      "usage": {
+        "peak_gpu_used_mib": 13443,
+        "peak_process_rss_mib": 66774.8,
+        "peak_wddm_dedicated_mib": null,
+        "peak_wddm_shared_mib": null,
+        "memory_sampling_seconds": 2,
+        "startup_seconds": 59.94,
+        "elapsed_seconds": 138.44,
+        "memory_samples": 64,
+        "minimum_system_available_ram_mib": 55804.4,
+        "steady_wddm_shared_mib": null,
+        "phase_peaks": {
+          "cold": {
+            "gpu_used_mib": 13443,
+            "process_rss_mib": 66288.6
+          },
+          "startup": {
+            "gpu_used_mib": 13306,
+            "process_rss_mib": 65852.7
+          },
+          "warm": {
+            "gpu_used_mib": 13442,
+            "process_rss_mib": 66774.8
+          }
+        }
+      },
+      "expert_cache": null,
+      "decode_intervals": []
+    },
+    {
+      "id": "stream-u1024-e48",
+      "suite": "short",
+      "status": "ok",
+      "checkpoint": "integration",
+      "config": {
+        "context": 262144,
+        "cache_k": "q8_0",
+        "cache_v": "q8_0",
+        "microbatch": 1024,
+        "batch": 8138,
+        "expert_slots": 48,
+        "expert_inserts": 2,
+        "arena_mib": 4000,
+        "mtp_tokens": 0,
+        "cpu_only": false,
+        "threads": 13,
+        "threads_batch": 15,
+        "checkpoints": 32,
+        "kv_mode": "streaming",
+        "expert_staging": 2,
+        "resident_experts": 46,
+        "sparse_resident_kv": false
+      },
+      "measurements": [
+        {
+          "phase": "cold",
+          "cache_n": 0,
+          "prompt_n": 2117,
+          "prompt_ms": 29861.16,
+          "prompt_per_second": 70.89476765135714,
+          "predicted_n": 128,
+          "predicted_ms": 12921.628,
+          "predicted_per_second": 9.828482912524644
+        },
+        {
+          "phase": "warm",
+          "cache_n": 0,
+          "prompt_n": 2116,
+          "prompt_ms": 14123.825,
+          "prompt_per_second": 149.81777245186768,
+          "predicted_n": 128,
+          "predicted_ms": 12270.723,
+          "predicted_per_second": 10.349838391755727
+        }
+      ],
+      "usage": {
+        "peak_gpu_used_mib": 15216,
+        "peak_process_rss_mib": 66723.0,
+        "peak_wddm_dedicated_mib": null,
+        "peak_wddm_shared_mib": null,
+        "memory_sampling_seconds": 2,
+        "startup_seconds": 59.61,
+        "elapsed_seconds": 136.78,
+        "memory_samples": 63,
+        "minimum_system_available_ram_mib": 55918.4,
+        "steady_wddm_shared_mib": null,
+        "phase_peaks": {
+          "cold": {
+            "gpu_used_mib": 15214,
+            "process_rss_mib": 66289.1
+          },
+          "startup": {
+            "gpu_used_mib": 15046,
+            "process_rss_mib": 65707.6
+          },
+          "warm": {
+            "gpu_used_mib": 15216,
+            "process_rss_mib": 66723.0
+          }
+        }
+      },
+      "expert_cache": null,
+      "decode_intervals": []
+    },
+    {
+      "id": "stream-u1024-e48-search",
+      "suite": "short",
+      "status": "ok",
+      "checkpoint": "integration",
+      "config": {
+        "context": 262144,
+        "cache_k": "q8_0",
+        "cache_v": "q8_0",
+        "microbatch": 1024,
+        "batch": 8138,
+        "expert_slots": 48,
+        "expert_inserts": 2,
+        "arena_mib": 4000,
+        "mtp_tokens": 0,
+        "cpu_only": false,
+        "threads": 13,
+        "threads_batch": 15,
+        "checkpoints": 32,
+        "kv_mode": "streaming",
+        "expert_staging": 2,
+        "resident_experts": 46,
+        "sparse_resident_kv": false
+      },
+      "measurements": [
+        {
+          "phase": "cold",
+          "cache_n": 0,
+          "prompt_n": 2117,
+          "prompt_ms": 30013.993,
+          "prompt_per_second": 70.53376736644138,
+          "predicted_n": 128,
+          "predicted_ms": 12775.932,
+          "predicted_per_second": 9.940566371204856
+        },
+        {
+          "phase": "warm",
+          "cache_n": 0,
+          "prompt_n": 2116,
+          "prompt_ms": 14204.694,
+          "prompt_per_second": 148.96484218526638,
+          "predicted_n": 128,
+          "predicted_ms": 12379.874,
+          "predicted_per_second": 10.258585830518145
+        }
+      ],
+      "usage": {
+        "peak_gpu_used_mib": 15215,
+        "peak_process_rss_mib": 66821.1,
+        "peak_wddm_dedicated_mib": 14937.75,
+        "peak_wddm_shared_mib": 60894.0,
+        "memory_sampling_seconds": 2,
+        "startup_seconds": 97.92,
+        "elapsed_seconds": 172.95,
+        "memory_samples": 82,
+        "minimum_system_available_ram_mib": 55261.8,
+        "steady_wddm_shared_mib": 60894.0,
+        "phase_peaks": {
+          "cold": {
+            "gpu_used_mib": 15210,
+            "process_rss_mib": 66288.2
+          },
+          "startup": {
+            "gpu_used_mib": 15077,
+            "process_rss_mib": 65853.1
+          },
+          "warm": {
+            "gpu_used_mib": 15215,
+            "process_rss_mib": 66821.1
+          }
+        }
+      },
+      "expert_cache": null,
+      "decode_intervals": []
+    },
+    {
+      "id": "stream-u1024-e52-search",
+      "suite": "short",
+      "status": "ok",
+      "checkpoint": "integration",
+      "config": {
+        "context": 262144,
+        "cache_k": "q8_0",
+        "cache_v": "q8_0",
+        "microbatch": 1024,
+        "batch": 8138,
+        "expert_slots": 52,
+        "expert_inserts": 2,
+        "arena_mib": 4000,
+        "mtp_tokens": 0,
+        "cpu_only": false,
+        "threads": 13,
+        "threads_batch": 15,
+        "checkpoints": 32,
+        "kv_mode": "streaming",
+        "expert_staging": 2,
+        "resident_experts": 50,
+        "sparse_resident_kv": false
+      },
+      "measurements": [
+        {
+          "phase": "cold",
+          "cache_n": 0,
+          "prompt_n": 2117,
+          "prompt_ms": 29917.957,
+          "prompt_per_second": 70.76017924619653,
+          "predicted_n": 128,
+          "predicted_ms": 12301.293,
+          "predicted_per_second": 10.32411796060788
+        },
+        {
+          "phase": "warm",
+          "cache_n": 0,
+          "prompt_n": 2116,
+          "prompt_ms": 14134.181,
+          "prompt_per_second": 149.70800218279362,
+          "predicted_n": 128,
+          "predicted_ms": 12115.03,
+          "predicted_per_second": 10.482846513793197
+        }
+      ],
+      "usage": {
+        "peak_gpu_used_mib": 15552,
+        "peak_process_rss_mib": 66721.4,
+        "peak_wddm_dedicated_mib": 15379.75390625,
+        "peak_wddm_shared_mib": 60894.0,
+        "memory_sampling_seconds": 2,
+        "startup_seconds": 48.88,
+        "elapsed_seconds": 122.81,
+        "memory_samples": 58,
+        "minimum_system_available_ram_mib": 55511.1,
+        "steady_wddm_shared_mib": 60894.0,
+        "phase_peaks": {
+          "cold": {
+            "gpu_used_mib": 15550,
+            "process_rss_mib": 66348.2
+          },
+          "startup": {
+            "gpu_used_mib": 15382,
+            "process_rss_mib": 65726.2
+          },
+          "warm": {
+            "gpu_used_mib": 15552,
+            "process_rss_mib": 66721.4
+          }
+        }
+      },
+      "expert_cache": null,
+      "decode_intervals": []
+    },
+    {
+      "id": "stream-u1024-e54-search",
+      "suite": "short",
+      "status": "ok",
+      "checkpoint": "integration",
+      "config": {
+        "context": 262144,
+        "cache_k": "q8_0",
+        "cache_v": "q8_0",
+        "microbatch": 1024,
+        "batch": 8138,
+        "expert_slots": 54,
+        "expert_inserts": 2,
+        "arena_mib": 4000,
+        "mtp_tokens": 0,
+        "cpu_only": false,
+        "threads": 13,
+        "threads_batch": 15,
+        "checkpoints": 32,
+        "kv_mode": "streaming",
+        "expert_staging": 2,
+        "resident_experts": 52,
+        "sparse_resident_kv": false
+      },
+      "measurements": [
+        {
+          "phase": "cold",
+          "cache_n": 0,
+          "prompt_n": 2117,
+          "prompt_ms": 31775.189,
+          "prompt_per_second": 66.6243086705165,
+          "predicted_n": 128,
+          "predicted_ms": 13013.789,
+          "predicted_per_second": 9.758879600706603
+        },
+        {
+          "phase": "warm",
+          "cache_n": 0,
+          "prompt_n": 2116,
+          "prompt_ms": 14440.428,
+          "prompt_per_second": 146.53305289843212,
+          "predicted_n": 128,
+          "predicted_ms": 12485.517,
+          "predicted_per_second": 10.171785437479281
+        }
+      ],
+      "usage": {
+        "peak_gpu_used_mib": 15779,
+        "peak_process_rss_mib": 66821.8,
+        "peak_wddm_dedicated_mib": 15537.8828125,
+        "peak_wddm_shared_mib": 60958.0,
+        "memory_sampling_seconds": 2,
+        "startup_seconds": 61.88,
+        "elapsed_seconds": 141.0,
+        "memory_samples": 65,
+        "minimum_system_available_ram_mib": 55197.6,
+        "steady_wddm_shared_mib": 60958.0,
+        "phase_peaks": {
+          "cold": {
+            "gpu_used_mib": 15774,
+            "process_rss_mib": 66386.3
+          },
+          "startup": {
+            "gpu_used_mib": 15182,
+            "process_rss_mib": 64886.1
+          },
+          "warm": {
+            "gpu_used_mib": 15779,
+            "process_rss_mib": 66821.8
+          }
+        }
+      },
+      "expert_cache": null,
+      "decode_intervals": []
+    },
+    {
+      "id": "stream-u1024-e56-search",
+      "suite": "short",
+      "status": "ok",
+      "checkpoint": "integration",
+      "config": {
+        "context": 262144,
+        "cache_k": "q8_0",
+        "cache_v": "q8_0",
+        "microbatch": 1024,
+        "batch": 8138,
+        "expert_slots": 56,
+        "expert_inserts": 2,
+        "arena_mib": 4000,
+        "mtp_tokens": 0,
+        "cpu_only": false,
+        "threads": 13,
+        "threads_batch": 15,
+        "checkpoints": 32,
+        "kv_mode": "streaming",
+        "expert_staging": 2,
+        "resident_experts": 54,
+        "sparse_resident_kv": false
+      },
+      "measurements": [
+        {
+          "phase": "cold",
+          "cache_n": 0,
+          "prompt_n": 2117,
+          "prompt_ms": 36519.414,
+          "prompt_per_second": 57.969166756071175,
+          "predicted_n": 128,
+          "predicted_ms": 14081.557,
+          "predicted_per_second": 9.018889033364704
+        },
+        {
+          "phase": "warm",
+          "cache_n": 0,
+          "prompt_n": 2116,
+          "prompt_ms": 20901.018,
+          "prompt_per_second": 101.23908797169592,
+          "predicted_n": 128,
+          "predicted_ms": 13243.463,
+          "predicted_per_second": 9.58963678910871
+        }
+      ],
+      "usage": {
+        "peak_gpu_used_mib": 15775,
+        "peak_process_rss_mib": 67036.8,
+        "peak_wddm_dedicated_mib": 15568.265625,
+        "peak_wddm_shared_mib": 61150.0,
+        "memory_sampling_seconds": 2,
+        "startup_seconds": 65.66,
+        "elapsed_seconds": 158.2,
+        "memory_samples": 73,
+        "minimum_system_available_ram_mib": 54992.5,
+        "steady_wddm_shared_mib": 61150.0,
+        "phase_peaks": {
+          "cold": {
+            "gpu_used_mib": 15773,
+            "process_rss_mib": 66602.9
+          },
+          "startup": {
+            "gpu_used_mib": 15735,
+            "process_rss_mib": 65880.6
+          },
+          "warm": {
+            "gpu_used_mib": 15775,
+            "process_rss_mib": 67036.8
+          }
+        }
+      },
+      "expert_cache": null,
+      "decode_intervals": []
+    },
+    {
+      "id": "stream-u2048-e16",
+      "suite": "short",
+      "status": "ok",
+      "checkpoint": "integration",
+      "config": {
+        "context": 262144,
+        "cache_k": "q8_0",
+        "cache_v": "q8_0",
+        "microbatch": 2048,
+        "batch": 8138,
+        "expert_slots": 16,
+        "expert_inserts": 2,
+        "arena_mib": 8192,
+        "mtp_tokens": 0,
+        "cpu_only": false,
+        "threads": 13,
+        "threads_batch": 15,
+        "checkpoints": 32,
+        "kv_mode": "streaming",
+        "expert_staging": 2,
+        "resident_experts": 14,
+        "sparse_resident_kv": false
+      },
+      "measurements": [
+        {
+          "phase": "cold",
+          "cache_n": 0,
+          "prompt_n": 2117,
+          "prompt_ms": 26837.188,
+          "prompt_per_second": 78.88307821221807,
+          "predicted_n": 128,
+          "predicted_ms": 15314.085,
+          "predicted_per_second": 8.293019138916886
+        },
+        {
+          "phase": "warm",
+          "cache_n": 0,
+          "prompt_n": 2116,
+          "prompt_ms": 11309.807,
+          "prompt_per_second": 187.09426252808734,
+          "predicted_n": 128,
+          "predicted_ms": 15324.592,
+          "predicted_per_second": 8.287333196211684
+        }
+      ],
+      "usage": {
+        "peak_gpu_used_mib": 15786,
+        "peak_process_rss_mib": 67654.4,
+        "peak_wddm_dedicated_mib": null,
+        "peak_wddm_shared_mib": null,
+        "memory_sampling_seconds": 2,
+        "startup_seconds": 46.62,
+        "elapsed_seconds": 120.72,
+        "memory_samples": 57,
+        "minimum_system_available_ram_mib": 54882.6,
+        "steady_wddm_shared_mib": null,
+        "phase_peaks": {
+          "cold": {
+            "gpu_used_mib": 15784,
+            "process_rss_mib": 67222.0
+          },
+          "startup": {
+            "gpu_used_mib": 15690,
+            "process_rss_mib": 66112.1
+          },
+          "warm": {
+            "gpu_used_mib": 15786,
+            "process_rss_mib": 67654.4
+          }
+        }
+      },
+      "expert_cache": null,
+      "decode_intervals": []
+    },
+    {
+      "id": "stream-u4096-e16",
+      "suite": "short",
+      "status": "failed",
+      "checkpoint": "integration",
+      "config": {
+        "context": 262144,
+        "cache_k": "q8_0",
+        "cache_v": "q8_0",
+        "microbatch": 4096,
+        "batch": 8138,
+        "expert_slots": 16,
+        "expert_inserts": 2,
+        "arena_mib": 8192,
+        "mtp_tokens": 0,
+        "cpu_only": false,
+        "threads": 13,
+        "threads_batch": 15,
+        "checkpoints": 32,
+        "kv_mode": "streaming",
+        "expert_staging": 2,
+        "resident_experts": 14,
+        "sparse_resident_kv": false
+      },
+      "measurements": [],
+      "failure": "Prefill workspace exceeds the 8192 MiB arena.",
+      "usage": {
+        "peak_gpu_used_mib": 15128,
+        "peak_process_rss_mib": 64541.7,
+        "peak_wddm_dedicated_mib": null,
+        "peak_wddm_shared_mib": null,
+        "memory_sampling_seconds": 2,
+        "startup_seconds": null,
+        "elapsed_seconds": 69.75,
+        "memory_samples": 33,
+        "minimum_system_available_ram_mib": 57996.1,
+        "steady_wddm_shared_mib": null,
+        "phase_peaks": {
+          "startup": {
+            "gpu_used_mib": 15128,
+            "process_rss_mib": 64541.7
+          }
+        }
+      },
+      "expert_cache": null,
+      "decode_intervals": []
+    },
+    {
+      "id": "stream-u512-e16",
+      "suite": "short",
+      "status": "ok",
+      "checkpoint": "integration",
+      "config": {
+        "context": 262144,
+        "cache_k": "q8_0",
+        "cache_v": "q8_0",
+        "microbatch": 512,
+        "batch": 8138,
+        "expert_slots": 16,
+        "expert_inserts": 2,
+        "arena_mib": 4000,
+        "mtp_tokens": 0,
+        "cpu_only": false,
+        "threads": 13,
+        "threads_batch": 15,
+        "checkpoints": 32,
+        "kv_mode": "streaming",
+        "expert_staging": 2,
+        "resident_experts": 14,
+        "sparse_resident_kv": false
+      },
+      "measurements": [
+        {
+          "phase": "cold",
+          "cache_n": 0,
+          "prompt_n": 2117,
+          "prompt_ms": 37503.985,
+          "prompt_per_second": 56.4473348632152,
+          "predicted_n": 128,
+          "predicted_ms": 14639.394,
+          "predicted_per_second": 8.675222485302328
+        },
+        {
+          "phase": "warm",
+          "cache_n": 0,
+          "prompt_n": 2116,
+          "prompt_ms": 20049.285,
+          "prompt_per_second": 105.53992324414561,
+          "predicted_n": 128,
+          "predicted_ms": 14303.587,
+          "predicted_per_second": 8.878891707373821
+        }
+      ],
+      "usage": {
+        "peak_gpu_used_mib": 11657,
+        "peak_process_rss_mib": 66433.8,
+        "peak_wddm_dedicated_mib": null,
+        "peak_wddm_shared_mib": null,
+        "memory_sampling_seconds": 2,
+        "startup_seconds": 53.69,
+        "elapsed_seconds": 147.72,
+        "memory_samples": 69,
+        "minimum_system_available_ram_mib": 55742.4,
+        "steady_wddm_shared_mib": null,
+        "phase_peaks": {
+          "cold": {
+            "gpu_used_mib": 11653,
+            "process_rss_mib": 66030.3
+          },
+          "startup": {
+            "gpu_used_mib": 10975,
+            "process_rss_mib": 64885.5
+          },
+          "warm": {
+            "gpu_used_mib": 11657,
+            "process_rss_mib": 66433.8
+          }
+        }
+      },
+      "expert_cache": null,
+      "decode_intervals": []
+    },
+    {
+      "id": "stream-u512-e16-mtp1",
+      "suite": "short",
+      "status": "unsupported",
+      "checkpoint": "integration",
+      "config": {
+        "context": 262144,
+        "cache_k": "q8_0",
+        "cache_v": "q8_0",
+        "microbatch": 512,
+        "batch": 8138,
+        "expert_slots": 16,
+        "expert_inserts": 2,
+        "arena_mib": 4000,
+        "mtp_tokens": 1,
+        "cpu_only": false,
+        "threads": 13,
+        "threads_batch": 15,
+        "checkpoints": 32,
+        "kv_mode": "streaming",
+        "expert_staging": 2,
+        "resident_experts": 14,
+        "sparse_resident_kv": false
+      },
+      "measurements": [],
+      "failure": "Streaming KV does not support this speculative multi-token decode batch.",
+      "usage": {
+        "peak_gpu_used_mib": 15493,
+        "peak_process_rss_mib": 69561.3,
+        "peak_wddm_dedicated_mib": null,
+        "peak_wddm_shared_mib": null,
+        "memory_sampling_seconds": 2,
+        "startup_seconds": 58.67,
+        "elapsed_seconds": 103.06,
+        "memory_samples": 48,
+        "minimum_system_available_ram_mib": 52997.3,
+        "steady_wddm_shared_mib": null,
+        "phase_peaks": {
+          "cold": {
+            "gpu_used_mib": 15493,
+            "process_rss_mib": 69561.3
+          },
+          "startup": {
+            "gpu_used_mib": 14187,
+            "process_rss_mib": 68065.2
+          }
+        }
+      },
+      "expert_cache": null,
+      "decode_intervals": []
+    },
+    {
+      "id": "stream-u512-e32",
+      "suite": "short",
+      "status": "ok",
+      "checkpoint": "integration",
+      "config": {
+        "context": 262144,
+        "cache_k": "q8_0",
+        "cache_v": "q8_0",
+        "microbatch": 512,
+        "batch": 8138,
+        "expert_slots": 32,
+        "expert_inserts": 2,
+        "arena_mib": 4000,
+        "mtp_tokens": 0,
+        "cpu_only": false,
+        "threads": 13,
+        "threads_batch": 15,
+        "checkpoints": 32,
+        "kv_mode": "streaming",
+        "expert_staging": 2,
+        "resident_experts": 30,
+        "sparse_resident_kv": false
+      },
+      "measurements": [
+        {
+          "phase": "cold",
+          "cache_n": 0,
+          "prompt_n": 2117,
+          "prompt_ms": 36678.742,
+          "prompt_per_second": 57.71735573700974,
+          "predicted_n": 128,
+          "predicted_ms": 13568.238,
+          "predicted_per_second": 9.360095245970776
+        },
+        {
+          "phase": "warm",
+          "cache_n": 0,
+          "prompt_n": 2116,
+          "prompt_ms": 20193.253,
+          "prompt_per_second": 104.7874753017753,
+          "predicted_n": 128,
+          "predicted_ms": 13315.461,
+          "predicted_per_second": 9.53778468503644
+        }
+      ],
+      "usage": {
+        "peak_gpu_used_mib": 13429,
+        "peak_process_rss_mib": 66397.9,
+        "peak_wddm_dedicated_mib": null,
+        "peak_wddm_shared_mib": null,
+        "memory_sampling_seconds": 2,
+        "startup_seconds": 52.67,
+        "elapsed_seconds": 142.11,
+        "memory_samples": 67,
+        "minimum_system_available_ram_mib": 56205.9,
+        "steady_wddm_shared_mib": null,
+        "phase_peaks": {
+          "cold": {
+            "gpu_used_mib": 13427,
+            "process_rss_mib": 65887.2
+          },
+          "startup": {
+            "gpu_used_mib": 13273,
+            "process_rss_mib": 65072.0
+          },
+          "warm": {
+            "gpu_used_mib": 13429,
+            "process_rss_mib": 66397.9
+          }
+        }
+      },
+      "expert_cache": null,
+      "decode_intervals": []
+    },
+    {
+      "id": "stream-u512-e48",
+      "suite": "short",
+      "status": "ok",
+      "checkpoint": "integration",
+      "config": {
+        "context": 262144,
+        "cache_k": "q8_0",
+        "cache_v": "q8_0",
+        "microbatch": 512,
+        "batch": 8138,
+        "expert_slots": 48,
+        "expert_inserts": 2,
+        "arena_mib": 4000,
+        "mtp_tokens": 0,
+        "cpu_only": false,
+        "threads": 13,
+        "threads_batch": 15,
+        "checkpoints": 32,
+        "kv_mode": "streaming",
+        "expert_staging": 2,
+        "resident_experts": 46,
+        "sparse_resident_kv": false
+      },
+      "measurements": [
+        {
+          "phase": "cold",
+          "cache_n": 0,
+          "prompt_n": 2117,
+          "prompt_ms": 37465.657,
+          "prompt_per_second": 56.50508144031746,
+          "predicted_n": 128,
+          "predicted_ms": 12554.708,
+          "predicted_per_second": 10.115727104126993
+        },
+        {
+          "phase": "warm",
+          "cache_n": 0,
+          "prompt_n": 2116,
+          "prompt_ms": 20081.562,
+          "prompt_per_second": 105.37028942270526,
+          "predicted_n": 128,
+          "predicted_ms": 12275.608,
+          "predicted_per_second": 10.345719739502924
+        }
+      ],
+      "usage": {
+        "peak_gpu_used_mib": 15203,
+        "peak_process_rss_mib": 66319.0,
+        "peak_wddm_dedicated_mib": null,
+        "peak_wddm_shared_mib": null,
+        "memory_sampling_seconds": 2,
+        "startup_seconds": 62.23,
+        "elapsed_seconds": 152.38,
+        "memory_samples": 71,
+        "minimum_system_available_ram_mib": 56293.4,
+        "steady_wddm_shared_mib": null,
+        "phase_peaks": {
+          "cold": {
+            "gpu_used_mib": 15201,
+            "process_rss_mib": 65884.6
+          },
+          "startup": {
+            "gpu_used_mib": 15081,
+            "process_rss_mib": 65453.2
+          },
+          "warm": {
+            "gpu_used_mib": 15203,
+            "process_rss_mib": 66319.0
+          }
+        }
+      },
+      "expert_cache": null,
+      "decode_intervals": []
+    },
+    {
+      "id": "stream-u1024-e48-fiction-scifi",
+      "suite": "fiction-scifi",
+      "status": "ok",
+      "checkpoint": "integration",
+      "config": {
+        "context": 262144,
+        "cache_k": "q8_0",
+        "cache_v": "q8_0",
+        "microbatch": 1024,
+        "batch": 8138,
+        "expert_slots": 48,
+        "expert_inserts": 2,
+        "arena_mib": 4000,
+        "mtp_tokens": 0,
+        "cpu_only": false,
+        "threads": 13,
+        "threads_batch": 15,
+        "checkpoints": 32,
+        "kv_mode": "streaming",
+        "expert_staging": 2,
+        "resident_experts": 46,
+        "sparse_resident_kv": false
+      },
+      "measurements": [
+        {
+          "phase": "long",
+          "cache_n": 0,
+          "prompt_n": 305,
+          "prompt_ms": 21783.305,
+          "prompt_per_second": 14.001548433536602,
+          "predicted_n": 20480,
+          "predicted_ms": 1807161.774,
+          "predicted_per_second": 11.332134341615395
+        }
+      ],
+      "usage": {
+        "peak_gpu_used_mib": 15096,
+        "peak_process_rss_mib": 66231.8,
+        "peak_wddm_dedicated_mib": 14920.1953125,
+        "peak_wddm_shared_mib": 60894.0,
+        "memory_sampling_seconds": 2,
+        "startup_seconds": 46.74,
+        "elapsed_seconds": 1880.97,
+        "memory_samples": 907,
+        "minimum_system_available_ram_mib": 56012.4,
+        "steady_wddm_shared_mib": 60098.0,
+        "phase_peaks": {
+          "long": {
+            "gpu_used_mib": 15096,
+            "process_rss_mib": 66231.8
+          },
+          "startup": {
+            "gpu_used_mib": 14940,
+            "process_rss_mib": 65292.6
+          }
+        }
+      },
+      "expert_cache": {
+        "steps": 20480,
+        "hits": 5287657,
+        "misses": 4544143,
+        "hit_rate": 53.8
+      },
+      "decode_intervals": [
+        {
+          "token_start": 1,
+          "token_end": 1025,
+          "seconds": 75.902462,
+          "tokens_per_second": 13.49099848697925
+        },
+        {
+          "token_start": 1025,
+          "token_end": 2049,
+          "seconds": 80.96787400000001,
+          "tokens_per_second": 12.646991323991042
+        },
+        {
+          "token_start": 2049,
+          "token_end": 3073,
+          "seconds": 88.290177,
+          "tokens_per_second": 11.59811923358133
+        },
+        {
+          "token_start": 3073,
+          "token_end": 4097,
+          "seconds": 88.624932,
+          "tokens_per_second": 11.554310698935149
+        },
+        {
+          "token_start": 4097,
+          "token_end": 5121,
+          "seconds": 88.35331199999997,
+          "tokens_per_second": 11.589831516446155
+        },
+        {
+          "token_start": 5121,
+          "token_end": 6145,
+          "seconds": 85.53961300000002,
+          "tokens_per_second": 11.971061875157185
+        },
+        {
+          "token_start": 6145,
+          "token_end": 7169,
+          "seconds": 88.02940399999999,
+          "tokens_per_second": 11.632476802864645
+        },
+        {
+          "token_start": 7169,
+          "token_end": 8193,
+          "seconds": 88.08022200000006,
+          "tokens_per_second": 11.625765430064416
+        },
+        {
+          "token_start": 8193,
+          "token_end": 9217,
+          "seconds": 88.18775500000001,
+          "tokens_per_second": 11.611589386757831
+        },
+        {
+          "token_start": 9217,
+          "token_end": 10241,
+          "seconds": 95.33734199999995,
+          "tokens_per_second": 10.740807101586707
+        },
+        {
+          "token_start": 10241,
+          "token_end": 11265,
+          "seconds": 94.55962199999998,
+          "tokens_per_second": 10.829146503990893
+        },
+        {
+          "token_start": 11265,
+          "token_end": 12289,
+          "seconds": 95.99693900000013,
+          "tokens_per_second": 10.667006788622693
+        },
+        {
+          "token_start": 12289,
+          "token_end": 13313,
+          "seconds": 95.22746600000002,
+          "tokens_per_second": 10.753200132407176
+        },
+        {
+          "token_start": 13313,
+          "token_end": 14337,
+          "seconds": 96.39159899999993,
+          "tokens_per_second": 10.62333243377362
+        },
+        {
+          "token_start": 14337,
+          "token_end": 15361,
+          "seconds": 94.595321,
+          "tokens_per_second": 10.825059729962755
+        },
+        {
+          "token_start": 15361,
+          "token_end": 16385,
+          "seconds": 91.90144799999986,
+          "tokens_per_second": 11.142370683865629
+        },
+        {
+          "token_start": 16385,
+          "token_end": 17409,
+          "seconds": 91.96025400000019,
+          "tokens_per_second": 11.135245450713935
+        },
+        {
+          "token_start": 17409,
+          "token_end": 18433,
+          "seconds": 92.61992499999981,
+          "tokens_per_second": 11.055936398134657
+        },
+        {
+          "token_start": 18433,
+          "token_end": 19457,
+          "seconds": 93.04311400000006,
+          "tokens_per_second": 11.00565056324318
+        },
+        {
+          "token_start": 19457,
+          "token_end": 20480,
+          "seconds": 93.55299300000001,
+          "tokens_per_second": 10.934978852039505
+        }
+      ]
+    },
+    {
+      "id": "stream-u1024-e52-fiction-scifi",
+      "suite": "fiction-scifi",
+      "status": "ok",
+      "checkpoint": "integration",
+      "config": {
+        "context": 262144,
+        "cache_k": "q8_0",
+        "cache_v": "q8_0",
+        "microbatch": 1024,
+        "batch": 8138,
+        "expert_slots": 52,
+        "expert_inserts": 2,
+        "arena_mib": 4000,
+        "mtp_tokens": 0,
+        "cpu_only": false,
+        "threads": 13,
+        "threads_batch": 15,
+        "checkpoints": 32,
+        "kv_mode": "streaming",
+        "expert_staging": 2,
+        "resident_experts": 50,
+        "sparse_resident_kv": false
+      },
+      "measurements": [
+        {
+          "phase": "long",
+          "cache_n": 0,
+          "prompt_n": 305,
+          "prompt_ms": 21680.076,
+          "prompt_per_second": 14.068216366031189,
+          "predicted_n": 20480,
+          "predicted_ms": 1786347.606,
+          "predicted_per_second": 11.464174123342486
+        }
+      ],
+      "usage": {
+        "peak_gpu_used_mib": 15538,
+        "peak_process_rss_mib": 66273.4,
+        "peak_wddm_dedicated_mib": 15362.19921875,
+        "peak_wddm_shared_mib": 60894.0,
+        "memory_sampling_seconds": 2,
+        "startup_seconds": 62.92,
+        "elapsed_seconds": 1878.81,
+        "memory_samples": 903,
+        "minimum_system_available_ram_mib": 56163.6,
+        "steady_wddm_shared_mib": 60098.0,
+        "phase_peaks": {
+          "long": {
+            "gpu_used_mib": 15538,
+            "process_rss_mib": 66273.4
+          },
+          "startup": {
+            "gpu_used_mib": 15382,
+            "process_rss_mib": 65523.3
+          }
+        }
+      },
+      "expert_cache": {
+        "steps": 20480,
+        "hits": 5467039,
+        "misses": 4364761,
+        "hit_rate": 55.6
+      },
+      "decode_intervals": [
+        {
+          "token_start": 1,
+          "token_end": 1025,
+          "seconds": 74.464122,
+          "tokens_per_second": 13.751588986706913
+        },
+        {
+          "token_start": 1025,
+          "token_end": 2049,
+          "seconds": 79.22133199999999,
+          "tokens_per_second": 12.925811446846161
+        },
+        {
+          "token_start": 2049,
+          "token_end": 3073,
+          "seconds": 85.54466000000001,
+          "tokens_per_second": 11.970355601389963
+        },
+        {
+          "token_start": 3073,
+          "token_end": 4097,
+          "seconds": 84.87176199999999,
+          "tokens_per_second": 12.06526147059372
+        },
+        {
+          "token_start": 4097,
+          "token_end": 5121,
+          "seconds": 81.90026799999998,
+          "tokens_per_second": 12.503011589656827
+        },
+        {
+          "token_start": 5121,
+          "token_end": 6145,
+          "seconds": 82.79848200000002,
+          "tokens_per_second": 12.367376493689822
+        },
+        {
+          "token_start": 6145,
+          "token_end": 7169,
+          "seconds": 85.522597,
+          "tokens_per_second": 11.973443696991566
+        },
+        {
+          "token_start": 7169,
+          "token_end": 8193,
+          "seconds": 88.31556000000006,
+          "tokens_per_second": 11.594785788597155
+        },
+        {
+          "token_start": 8193,
+          "token_end": 9217,
+          "seconds": 92.19251799999992,
+          "tokens_per_second": 11.107192017469366
+        },
+        {
+          "token_start": 9217,
+          "token_end": 10241,
+          "seconds": 92.89173900000006,
+          "tokens_per_second": 11.023585208152895
+        },
+        {
+          "token_start": 10241,
+          "token_end": 11265,
+          "seconds": 93.00956999999995,
+          "tokens_per_second": 11.009619762783556
+        },
+        {
+          "token_start": 11265,
+          "token_end": 12289,
+          "seconds": 91.97040899999999,
+          "tokens_per_second": 11.134015942018918
+        },
+        {
+          "token_start": 12289,
+          "token_end": 13313,
+          "seconds": 92.71614600000007,
+          "tokens_per_second": 11.044462525437579
+        },
+        {
+          "token_start": 13313,
+          "token_end": 14337,
+          "seconds": 93.10812699999987,
+          "tokens_per_second": 10.997965838148602
+        },
+        {
+          "token_start": 14337,
+          "token_end": 15361,
+          "seconds": 96.82785900000017,
+          "tokens_per_second": 10.57546878114901
+        },
+        {
+          "token_start": 15361,
+          "token_end": 16385,
+          "seconds": 94.47497699999995,
+          "tokens_per_second": 10.838848894347976
+        },
+        {
+          "token_start": 16385,
+          "token_end": 17409,
+          "seconds": 93.48294999999996,
+          "tokens_per_second": 10.95386912800677
+        },
+        {
+          "token_start": 17409,
+          "token_end": 18433,
+          "seconds": 94.325892,
+          "tokens_per_second": 10.855980031442481
+        },
+        {
+          "token_start": 18433,
+          "token_end": 19457,
+          "seconds": 94.59169500000006,
+          "tokens_per_second": 10.825474688871992
+        },
+        {
+          "token_start": 19457,
+          "token_end": 20480,
+          "seconds": 94.11694099999987,
+          "tokens_per_second": 10.869456541304306
+        }
+      ]
+    },
+    {
+      "id": "stream-u1024-e52-i1-fiction-scifi",
+      "suite": "fiction-scifi",
+      "status": "ok",
+      "checkpoint": "integration",
+      "config": {
+        "context": 262144,
+        "cache_k": "q8_0",
+        "cache_v": "q8_0",
+        "microbatch": 1024,
+        "batch": 8138,
+        "expert_slots": 52,
+        "expert_inserts": 1,
+        "arena_mib": 4000,
+        "mtp_tokens": 0,
+        "cpu_only": false,
+        "threads": 13,
+        "threads_batch": 15,
+        "checkpoints": 32,
+        "kv_mode": "streaming",
+        "expert_staging": 2,
+        "resident_experts": 50,
+        "sparse_resident_kv": false
+      },
+      "measurements": [
+        {
+          "phase": "long",
+          "cache_n": 0,
+          "prompt_n": 305,
+          "prompt_ms": 21752.391,
+          "prompt_per_second": 14.021447113560988,
+          "predicted_n": 20480,
+          "predicted_ms": 1603989.457,
+          "predicted_per_second": 12.767540279412199
+        }
+      ],
+      "usage": {
+        "peak_gpu_used_mib": 15546,
+        "peak_process_rss_mib": 66187.4,
+        "peak_wddm_dedicated_mib": 15362.19921875,
+        "peak_wddm_shared_mib": 60894.0,
+        "memory_sampling_seconds": 2,
+        "startup_seconds": 60.05,
+        "elapsed_seconds": 1693.88,
+        "memory_samples": 811,
+        "minimum_system_available_ram_mib": 56195.6,
+        "steady_wddm_shared_mib": 60098.0,
+        "phase_peaks": {
+          "long": {
+            "gpu_used_mib": 15546,
+            "process_rss_mib": 66187.4
+          },
+          "startup": {
+            "gpu_used_mib": 15413,
+            "process_rss_mib": 65853.6
+          }
+        }
+      },
+      "expert_cache": {
+        "steps": 20480,
+        "hits": 5468386,
+        "misses": 4363414,
+        "hit_rate": 55.6
+      },
+      "decode_intervals": [
+        {
+          "token_start": 1,
+          "token_end": 1025,
+          "seconds": 66.657276,
+          "tokens_per_second": 15.362163914408985
+        },
+        {
+          "token_start": 1025,
+          "token_end": 2049,
+          "seconds": 72.24452000000001,
+          "tokens_per_second": 14.174085453125025
+        },
+        {
+          "token_start": 2049,
+          "token_end": 3073,
+          "seconds": 77.74649299999999,
+          "tokens_per_second": 13.17101209954255
+        },
+        {
+          "token_start": 3073,
+          "token_end": 4097,
+          "seconds": 79.44205200000002,
+          "tokens_per_second": 12.889898664752513
+        },
+        {
+          "token_start": 4097,
+          "token_end": 5121,
+          "seconds": 77.66326699999999,
+          "tokens_per_second": 13.185126502597425
+        },
+        {
+          "token_start": 5121,
+          "token_end": 6145,
+          "seconds": 75.51699199999997,
+          "tokens_per_second": 13.559862130101799
+        },
+        {
+          "token_start": 6145,
+          "token_end": 7169,
+          "seconds": 77.21094099999999,
+          "tokens_per_second": 13.262369124603728
+        },
+        {
+          "token_start": 7169,
+          "token_end": 8193,
+          "seconds": 76.94864199999999,
+          "tokens_per_second": 13.307577279921329
+        },
+        {
+          "token_start": 8193,
+          "token_end": 9217,
+          "seconds": 80.02487100000005,
+          "tokens_per_second": 12.796021876748785
+        },
+        {
+          "token_start": 9217,
+          "token_end": 10241,
+          "seconds": 84.339331,
+          "tokens_per_second": 12.1414290089638
+        },
+        {
+          "token_start": 10241,
+          "token_end": 11265,
+          "seconds": 78.47427000000002,
+          "tokens_per_second": 13.048863022236457
+        },
+        {
+          "token_start": 11265,
+          "token_end": 12289,
+          "seconds": 84.93765599999996,
+          "tokens_per_second": 12.055901330736045
+        },
+        {
+          "token_start": 12289,
+          "token_end": 13313,
+          "seconds": 83.26957500000007,
+          "tokens_per_second": 12.29740874743265
+        },
+        {
+          "token_start": 13313,
+          "token_end": 14337,
+          "seconds": 83.07549199999997,
+          "tokens_per_second": 12.326138255070465
+        },
+        {
+          "token_start": 14337,
+          "token_end": 15361,
+          "seconds": 83.93861299999989,
+          "tokens_per_second": 12.199391476721223
+        },
+        {
+          "token_start": 15361,
+          "token_end": 16385,
+          "seconds": 81.90486400000006,
+          "tokens_per_second": 12.502309997120552
+        },
+        {
+          "token_start": 16385,
+          "token_end": 17409,
+          "seconds": 84.42302600000006,
+          "tokens_per_second": 12.129392282148228
+        },
+        {
+          "token_start": 17409,
+          "token_end": 18433,
+          "seconds": 84.79871499999985,
+          "tokens_per_second": 12.075654684154138
+        },
+        {
+          "token_start": 18433,
+          "token_end": 19457,
+          "seconds": 85.29381900000013,
+          "tokens_per_second": 12.005559277396154
+        },
+        {
+          "token_start": 19457,
+          "token_end": 20480,
+          "seconds": 86.0790419999999,
+          "tokens_per_second": 11.884425944238567
+        }
+      ]
+    },
+    {
+      "id": "stream-u1024-e52-i3-s3-fiction-scifi",
+      "suite": "fiction-scifi",
+      "status": "ok",
+      "checkpoint": "integration",
+      "config": {
+        "context": 262144,
+        "cache_k": "q8_0",
+        "cache_v": "q8_0",
+        "microbatch": 1024,
+        "batch": 8138,
+        "expert_slots": 52,
+        "expert_inserts": 3,
+        "arena_mib": 4000,
+        "mtp_tokens": 0,
+        "cpu_only": false,
+        "threads": 13,
+        "threads_batch": 15,
+        "checkpoints": 32,
+        "kv_mode": "streaming",
+        "expert_staging": 3,
+        "resident_experts": 49,
+        "sparse_resident_kv": false
+      },
+      "measurements": [
+        {
+          "phase": "long",
+          "cache_n": 0,
+          "prompt_n": 305,
+          "prompt_ms": 21695.934,
+          "prompt_per_second": 14.057933620188926,
+          "predicted_n": 20480,
+          "predicted_ms": 1946889.234,
+          "predicted_per_second": 10.518831601900985
+        }
+      ],
+      "usage": {
+        "peak_gpu_used_mib": 15537,
+        "peak_process_rss_mib": 66317.8,
+        "peak_wddm_dedicated_mib": 15362.19921875,
+        "peak_wddm_shared_mib": 60894.0,
+        "memory_sampling_seconds": 2,
+        "startup_seconds": 50.84,
+        "elapsed_seconds": 2024.94,
+        "memory_samples": 975,
+        "minimum_system_available_ram_mib": 56151.1,
+        "steady_wddm_shared_mib": 60098.0,
+        "phase_peaks": {
+          "long": {
+            "gpu_used_mib": 15537,
+            "process_rss_mib": 66317.8
+          },
+          "startup": {
+            "gpu_used_mib": 15383,
+            "process_rss_mib": 65810.3
+          }
+        }
+      },
+      "expert_cache": {
+        "steps": 20480,
+        "hits": 5333248,
+        "misses": 4498552,
+        "hit_rate": 54.2
+      },
+      "decode_intervals": [
+        {
+          "token_start": 1,
+          "token_end": 1025,
+          "seconds": 79.652447,
+          "tokens_per_second": 12.855851120305193
+        },
+        {
+          "token_start": 1025,
+          "token_end": 2049,
+          "seconds": 86.490518,
+          "tokens_per_second": 11.839448111525936
+        },
+        {
+          "token_start": 2049,
+          "token_end": 3073,
+          "seconds": 92.21976200000002,
+          "tokens_per_second": 11.10391067806052
+        },
+        {
+          "token_start": 3073,
+          "token_end": 4097,
+          "seconds": 92.820978,
+          "tokens_per_second": 11.031988910955022
+        },
+        {
+          "token_start": 4097,
+          "token_end": 5121,
+          "seconds": 93.013609,
+          "tokens_per_second": 11.009141683772318
+        },
+        {
+          "token_start": 5121,
+          "token_end": 6145,
+          "seconds": 92.89103799999994,
+          "tokens_per_second": 11.023668397375435
+        },
+        {
+          "token_start": 6145,
+          "token_end": 7169,
+          "seconds": 90.190174,
+          "tokens_per_second": 11.353786721821825
+        },
+        {
+          "token_start": 7169,
+          "token_end": 8193,
+          "seconds": 96.2795,
+          "tokens_per_second": 10.635701265586132
+        },
+        {
+          "token_start": 8193,
+          "token_end": 9217,
+          "seconds": 102.45395000000006,
+          "tokens_per_second": 9.994734219617685
+        },
+        {
+          "token_start": 9217,
+          "token_end": 10241,
+          "seconds": 100.79837199999997,
+          "tokens_per_second": 10.158894232934637
+        },
+        {
+          "token_start": 10241,
+          "token_end": 11265,
+          "seconds": 100.15209900000005,
+          "tokens_per_second": 10.22444871574783
+        },
+        {
+          "token_start": 11265,
+          "token_end": 12289,
+          "seconds": 100.59584299999999,
+          "tokens_per_second": 10.179347073019708
+        },
+        {
+          "token_start": 12289,
+          "token_end": 13313,
+          "seconds": 100.7873189999999,
+          "tokens_per_second": 10.16000832406308
+        },
+        {
+          "token_start": 13313,
+          "token_end": 14337,
+          "seconds": 100.55152300000005,
+          "tokens_per_second": 10.183833814232724
+        },
+        {
+          "token_start": 14337,
+          "token_end": 15361,
+          "seconds": 101.63331400000001,
+          "tokens_per_second": 10.075436485324092
+        },
+        {
+          "token_start": 15361,
+          "token_end": 16385,
+          "seconds": 101.82796900000004,
+          "tokens_per_second": 10.056176216182802
+        },
+        {
+          "token_start": 16385,
+          "token_end": 17409,
+          "seconds": 102.84076300000004,
+          "tokens_per_second": 9.957141216464912
+        },
+        {
+          "token_start": 17409,
+          "token_end": 18433,
+          "seconds": 103.0328899999999,
+          "tokens_per_second": 9.938573983511489
+        },
+        {
+          "token_start": 18433,
+          "token_end": 19457,
+          "seconds": 104.02113700000011,
+          "tokens_per_second": 9.844153116688188
+        },
+        {
+          "token_start": 19457,
+          "token_end": 20480,
+          "seconds": 104.63602899999987,
+          "tokens_per_second": 9.776747166121924
+        }
+      ]
+    },
+    {
+      "id": "stream-u1024-e54-i1-s1-fiction-scifi",
+      "suite": "fiction-scifi",
+      "status": "ok",
+      "checkpoint": "integration",
+      "config": {
+        "context": 262144,
+        "cache_k": "q8_0",
+        "cache_v": "q8_0",
+        "microbatch": 1024,
+        "batch": 8138,
+        "expert_slots": 54,
+        "expert_inserts": 1,
+        "arena_mib": 4000,
+        "mtp_tokens": 0,
+        "cpu_only": false,
+        "threads": 13,
+        "threads_batch": 15,
+        "checkpoints": 32,
+        "kv_mode": "streaming",
+        "expert_staging": 1,
+        "resident_experts": 53,
+        "sparse_resident_kv": false
+      },
+      "measurements": [
+        {
+          "phase": "long",
+          "cache_n": 0,
+          "prompt_n": 305,
+          "prompt_ms": 23288.562,
+          "prompt_per_second": 13.09655787248693,
+          "predicted_n": 20480,
+          "predicted_ms": 1509581.482,
+          "predicted_per_second": 13.566011668921625
+        }
+      ],
+      "usage": {
+        "peak_gpu_used_mib": 15769,
+        "peak_process_rss_mib": 66187.4,
+        "peak_wddm_dedicated_mib": 15584.203125,
+        "peak_wddm_shared_mib": 60894.0,
+        "memory_sampling_seconds": 2,
+        "startup_seconds": 62.75,
+        "elapsed_seconds": 1603.12,
+        "memory_samples": 770,
+        "minimum_system_available_ram_mib": 56297.7,
+        "steady_wddm_shared_mib": 60098.0,
+        "phase_peaks": {
+          "long": {
+            "gpu_used_mib": 15769,
+            "process_rss_mib": 66187.4
+          },
+          "startup": {
+            "gpu_used_mib": 15639,
+            "process_rss_mib": 65852.2
+          }
+        }
+      },
+      "expert_cache": {
+        "steps": 20480,
+        "hits": 5641213,
+        "misses": 4190587,
+        "hit_rate": 57.4
+      },
+      "decode_intervals": [
+        {
+          "token_start": 1,
+          "token_end": 1025,
+          "seconds": 63.424605,
+          "tokens_per_second": 16.145153761698634
+        },
+        {
+          "token_start": 1025,
+          "token_end": 2049,
+          "seconds": 66.89938699999999,
+          "tokens_per_second": 15.306567756741929
+        },
+        {
+          "token_start": 2049,
+          "token_end": 3073,
+          "seconds": 73.218144,
+          "tokens_per_second": 13.98560444252725
+        },
+        {
+          "token_start": 3073,
+          "token_end": 4097,
+          "seconds": 72.17955599999998,
+          "tokens_per_second": 14.186842601248479
+        },
+        {
+          "token_start": 4097,
+          "token_end": 5121,
+          "seconds": 72.92400200000003,
+          "tokens_per_second": 14.04201596067094
+        },
+        {
+          "token_start": 5121,
+          "token_end": 6145,
+          "seconds": 72.06767300000001,
+          "tokens_per_second": 14.208867268407568
+        },
+        {
+          "token_start": 6145,
+          "token_end": 7169,
+          "seconds": 71.90686199999996,
+          "tokens_per_second": 14.240643681544613
+        },
+        {
+          "token_start": 7169,
+          "token_end": 8193,
+          "seconds": 76.09635800000007,
+          "tokens_per_second": 13.456622983191904
+        },
+        {
+          "token_start": 8193,
+          "token_end": 9217,
+          "seconds": 76.70597199999995,
+          "tokens_per_second": 13.349677649609871
+        },
+        {
+          "token_start": 9217,
+          "token_end": 10241,
+          "seconds": 78.59131700000003,
+          "tokens_per_second": 13.029429192540437
+        },
+        {
+          "token_start": 10241,
+          "token_end": 11265,
+          "seconds": 77.655961,
+          "tokens_per_second": 13.186366980894098
+        },
+        {
+          "token_start": 11265,
+          "token_end": 12289,
+          "seconds": 78.79127799999993,
+          "tokens_per_second": 12.996362363864701
+        },
+        {
+          "token_start": 12289,
+          "token_end": 13313,
+          "seconds": 76.63796999999997,
+          "tokens_per_second": 13.36152301528864
+        },
+        {
+          "token_start": 13313,
+          "token_end": 14337,
+          "seconds": 78.58514600000007,
+          "tokens_per_second": 13.030452345281628
+        },
+        {
+          "token_start": 14337,
+          "token_end": 15361,
+          "seconds": 77.01641000000004,
+          "tokens_per_second": 13.295867724813446
+        },
+        {
+          "token_start": 15361,
+          "token_end": 16385,
+          "seconds": 78.97439500000002,
+          "tokens_per_second": 12.96622785144476
+        },
+        {
+          "token_start": 16385,
+          "token_end": 17409,
+          "seconds": 79.87173399999993,
+          "tokens_per_second": 12.820555517174585
+        },
+        {
+          "token_start": 17409,
+          "token_end": 18433,
+          "seconds": 79.06059000000009,
+          "tokens_per_second": 12.952091554085277
+        },
+        {
+          "token_start": 18433,
+          "token_end": 19457,
+          "seconds": 79.3882629999998,
+          "tokens_per_second": 12.898632131553281
+        },
+        {
+          "token_start": 19457,
+          "token_end": 20480,
+          "seconds": 79.58585900000017,
+          "tokens_per_second": 12.854042324277707
+        }
+      ]
+    },
+    {
+      "id": "stream-u1024-e54-i1-s1-resident-fiction-scifi",
+      "suite": "fiction-scifi",
+      "status": "ok",
+      "checkpoint": "resident",
+      "config": {
+        "context": 262144,
+        "cache_k": "q8_0",
+        "cache_v": "q8_0",
+        "microbatch": 1024,
+        "batch": 8138,
+        "expert_slots": 54,
+        "expert_inserts": 1,
+        "arena_mib": 4000,
+        "mtp_tokens": 0,
+        "cpu_only": false,
+        "threads": 13,
+        "threads_batch": 15,
+        "checkpoints": 32,
+        "kv_mode": "streaming",
+        "expert_staging": 1,
+        "resident_experts": 53,
+        "sparse_resident_kv": true
+      },
+      "measurements": [
+        {
+          "phase": "long",
+          "cache_n": 0,
+          "prompt_n": 305,
+          "prompt_ms": 21615.35,
+          "prompt_per_second": 14.110342881332016,
+          "predicted_n": 20480,
+          "predicted_ms": 1410100.597,
+          "predicted_per_second": 14.523077320560837
+        }
+      ],
+      "usage": {
+        "peak_gpu_used_mib": 15776,
+        "peak_process_rss_mib": 66188.2,
+        "peak_wddm_dedicated_mib": 15584.203125,
+        "peak_wddm_shared_mib": 60894.0,
+        "memory_sampling_seconds": 2,
+        "startup_seconds": 63.94,
+        "elapsed_seconds": 1503.97,
+        "memory_samples": 721,
+        "minimum_system_available_ram_mib": 56024.0,
+        "steady_wddm_shared_mib": 60098.0,
+        "phase_peaks": {
+          "long": {
+            "gpu_used_mib": 15776,
+            "process_rss_mib": 66188.2
+          },
+          "startup": {
+            "gpu_used_mib": 15654,
+            "process_rss_mib": 65853.8
+          }
+        }
+      },
+      "expert_cache": {
+        "steps": 20480,
+        "hits": 5605755,
+        "misses": 4226045,
+        "hit_rate": 57.0
+      },
+      "decode_intervals": [
+        {
+          "token_start": 1,
+          "token_end": 1025,
+          "seconds": 64.313651,
+          "tokens_per_second": 15.921969660842299
+        },
+        {
+          "token_start": 1025,
+          "token_end": 2049,
+          "seconds": 67.64521200000001,
+          "tokens_per_second": 15.137804579576153
+        },
+        {
+          "token_start": 2049,
+          "token_end": 3073,
+          "seconds": 66.490889,
+          "tokens_per_second": 15.400606239450342
+        },
+        {
+          "token_start": 3073,
+          "token_end": 4097,
+          "seconds": 65.62329000000001,
+          "tokens_per_second": 15.604216125098267
+        },
+        {
+          "token_start": 4097,
+          "token_end": 5121,
+          "seconds": 66.674022,
+          "tokens_per_second": 15.358305518152182
+        },
+        {
+          "token_start": 5121,
+          "token_end": 6145,
+          "seconds": 66.028842,
+          "tokens_per_second": 15.508374355558136
+        },
+        {
+          "token_start": 6145,
+          "token_end": 7169,
+          "seconds": 68.83747899999999,
+          "tokens_per_second": 14.87561739441388
+        },
+        {
+          "token_start": 7169,
+          "token_end": 8193,
+          "seconds": 70.77796400000004,
+          "tokens_per_second": 14.467779830456829
+        },
+        {
+          "token_start": 8193,
+          "token_end": 9217,
+          "seconds": 70.78561399999994,
+          "tokens_per_second": 14.466216256879552
+        },
+        {
+          "token_start": 9217,
+          "token_end": 10241,
+          "seconds": 72.87880000000004,
+          "tokens_per_second": 14.050725313808671
+        },
+        {
+          "token_start": 10241,
+          "token_end": 11265,
+          "seconds": 73.65564500000002,
+          "tokens_per_second": 13.902532521438102
+        },
+        {
+          "token_start": 11265,
+          "token_end": 12289,
+          "seconds": 72.06919299999997,
+          "tokens_per_second": 14.208567591425652
+        },
+        {
+          "token_start": 12289,
+          "token_end": 13313,
+          "seconds": 70.84254599999997,
+          "tokens_per_second": 14.454590607175529
+        },
+        {
+          "token_start": 13313,
+          "token_end": 14337,
+          "seconds": 72.60012100000004,
+          "tokens_per_second": 14.104659687826132
+        },
+        {
+          "token_start": 14337,
+          "token_end": 15361,
+          "seconds": 72.47350699999998,
+          "tokens_per_second": 14.129301069975822
+        },
+        {
+          "token_start": 15361,
+          "token_end": 16385,
+          "seconds": 75.25629399999988,
+          "tokens_per_second": 13.60683532994598
+        },
+        {
+          "token_start": 16385,
+          "token_end": 17409,
+          "seconds": 73.62127600000007,
+          "tokens_per_second": 13.909022712401766
+        },
+        {
+          "token_start": 17409,
+          "token_end": 18433,
+          "seconds": 74.74212199999998,
+          "tokens_per_second": 13.700440562819455
+        },
+        {
+          "token_start": 18433,
+          "token_end": 19457,
+          "seconds": 72.82701000000002,
+          "tokens_per_second": 14.060717308042715
+        },
+        {
+          "token_start": 19457,
+          "token_end": 20480,
+          "seconds": 71.95712000000012,
+          "tokens_per_second": 14.216800227691136
+        }
+      ]
+    },
+    {
+      "id": "stream-u1024-e56-fiction-scifi",
+      "suite": "fiction-scifi",
+      "status": "ok",
+      "checkpoint": "integration",
+      "config": {
+        "context": 262144,
+        "cache_k": "q8_0",
+        "cache_v": "q8_0",
+        "microbatch": 1024,
+        "batch": 8138,
+        "expert_slots": 56,
+        "expert_inserts": 2,
+        "arena_mib": 4000,
+        "mtp_tokens": 0,
+        "cpu_only": false,
+        "threads": 13,
+        "threads_batch": 15,
+        "checkpoints": 32,
+        "kv_mode": "streaming",
+        "expert_staging": 2,
+        "resident_experts": 54,
+        "sparse_resident_kv": false
+      },
+      "measurements": [
+        {
+          "phase": "long",
+          "cache_n": 0,
+          "prompt_n": 305,
+          "prompt_ms": 21901.36,
+          "prompt_per_second": 13.926075823601822,
+          "predicted_n": 20480,
+          "predicted_ms": 2057267.859,
+          "predicted_per_second": 9.954464563479092
+        }
+      ],
+      "usage": {
+        "peak_gpu_used_mib": 15724,
+        "peak_process_rss_mib": 66492.6,
+        "peak_wddm_dedicated_mib": 15550.7109375,
+        "peak_wddm_shared_mib": 61150.0,
+        "memory_sampling_seconds": 2,
+        "startup_seconds": 65.75,
+        "elapsed_seconds": 2152.77,
+        "memory_samples": 1034,
+        "minimum_system_available_ram_mib": 55892.5,
+        "steady_wddm_shared_mib": 60354.0,
+        "phase_peaks": {
+          "long": {
+            "gpu_used_mib": 15724,
+            "process_rss_mib": 66492.6
+          },
+          "startup": {
+            "gpu_used_mib": 15700,
+            "process_rss_mib": 65901.5
+          }
+        }
+      },
+      "expert_cache": {
+        "steps": 20480,
+        "hits": 5694976,
+        "misses": 4136824,
+        "hit_rate": 57.9
+      },
+      "decode_intervals": [
+        {
+          "token_start": 1,
+          "token_end": 1025,
+          "seconds": 78.80820600000001,
+          "tokens_per_second": 12.993570745665748
+        },
+        {
+          "token_start": 1025,
+          "token_end": 2049,
+          "seconds": 87.047305,
+          "tokens_per_second": 11.763718589564606
+        },
+        {
+          "token_start": 2049,
+          "token_end": 3073,
+          "seconds": 99.58997000000004,
+          "tokens_per_second": 10.282159940403634
+        },
+        {
+          "token_start": 3073,
+          "token_end": 4097,
+          "seconds": 100.57935199999996,
+          "tokens_per_second": 10.181016079721815
+        },
+        {
+          "token_start": 4097,
+          "token_end": 5121,
+          "seconds": 98.955179,
+          "tokens_per_second": 10.348119323800121
+        },
+        {
+          "token_start": 5121,
+          "token_end": 6145,
+          "seconds": 97.60567000000005,
+          "tokens_per_second": 10.491193800524083
+        },
+        {
+          "token_start": 6145,
+          "token_end": 7169,
+          "seconds": 104.68950399999996,
+          "tokens_per_second": 9.781305296851922
+        },
+        {
+          "token_start": 7169,
+          "token_end": 8193,
+          "seconds": 105.80363,
+          "tokens_per_second": 9.678306878506909
+        },
+        {
+          "token_start": 8193,
+          "token_end": 9217,
+          "seconds": 107.92801100000005,
+          "tokens_per_second": 9.487805718943523
+        },
+        {
+          "token_start": 9217,
+          "token_end": 10241,
+          "seconds": 105.66516999999993,
+          "tokens_per_second": 9.690988998550807
+        },
+        {
+          "token_start": 10241,
+          "token_end": 11265,
+          "seconds": 105.04640000000013,
+          "tokens_per_second": 9.748073232400145
+        },
+        {
+          "token_start": 11265,
+          "token_end": 12289,
+          "seconds": 106.37429499999993,
+          "tokens_per_second": 9.6263857729915
+        },
+        {
+          "token_start": 12289,
+          "token_end": 13313,
+          "seconds": 104.30697699999996,
+          "tokens_per_second": 9.817176467495559
+        },
+        {
+          "token_start": 13313,
+          "token_end": 14337,
+          "seconds": 105.95385599999992,
+          "tokens_per_second": 9.664584552732096
+        },
+        {
+          "token_start": 14337,
+          "token_end": 15361,
+          "seconds": 106.43084200000018,
+          "tokens_per_second": 9.621271247670842
+        },
+        {
+          "token_start": 15361,
+          "token_end": 16385,
+          "seconds": 108.46686399999983,
+          "tokens_per_second": 9.440671208121234
+        },
+        {
+          "token_start": 16385,
+          "token_end": 17409,
+          "seconds": 108.00217400000011,
+          "tokens_per_second": 9.481290626612747
+        },
+        {
+          "token_start": 17409,
+          "token_end": 18433,
+          "seconds": 106.38061400000007,
+          "tokens_per_second": 9.625813966443166
+        },
+        {
+          "token_start": 18433,
+          "token_end": 19457,
+          "seconds": 108.9219339999999,
+          "tokens_per_second": 9.401228590010172
+        },
+        {
+          "token_start": 19457,
+          "token_end": 20480,
+          "seconds": 110.71190599999996,
+          "tokens_per_second": 9.240198610617366
+        }
+      ]
+    }
+  ]
+}</script><script>
+'use strict';
+const D=JSON.parse(document.getElementById('data').textContent),$=id=>document.getElementById(id),NS='http://www.w3.org/2000/svg';
+const fmt=(v,n=2)=>Number.isFinite(v)?v.toLocaleString('en-US',{minimumFractionDigits:n,maximumFractionDigits:n}):'\u2014';
+const esc=s=>String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const checkpoint=id=>D.checkpoints.find(c=>c.id===id);
+const short=D.cases.filter(c=>c.suite==='short'),long=D.cases.filter(c=>c.suite==='fiction-scifi');
+const palette=['#5ce0cf','#ffd082','#bcabff','#91dfa8','#ff9eab','#77b8ff','#ede078'];
+const selected=new Set(long.map(c=>c.id));
+const label=c=>c.config.cpu_only?'CPU baseline':`${c.config.kv_mode==='native'?'Native':'Stream'} u${c.config.microbatch} e${c.config.expert_slots} i${c.config.expert_inserts} s${c.config.expert_staging}${c.config.mtp_tokens?' MTP'+c.config.mtp_tokens:''}${c.config.sparse_resident_kv?' / resident KV':''}${c.id.endsWith('-search')?' / repeat':''}`;
+const phase=c=>c.suite==='short'?$('phase').value:'long';
+const measurement=c=>c.measurements.find(m=>m.phase===phase(c));
+const color=c=>c.suite==='fiction-scifi'?palette[long.indexOf(c)%palette.length]:c.config.cpu_only?'#a6b6cb':c.config.mtp_tokens?'#bcabff':c.config.kv_mode==='native'?'#ffd082':'#5ce0cf';
+function el(parent,tag,attrs={},text){const node=document.createElementNS(NS,tag);for(const [k,v]of Object.entries(attrs))node.setAttribute(k,v);if(text!==undefined)node.textContent=text;parent.append(node);return node}
+function title(node,text){el(node,'title',{},text);node.setAttribute('tabindex','0');node.setAttribute('aria-label',text)}
+function axes(id,maxX,maxY,xLabel,yLabel,h=320,minX=0){const s=$(id);s.replaceChildren();s.setAttribute('viewBox',`0 0 1100 ${h}`);const b={l:65,t:28,w:1005,h:h-85};for(let i=0;i<=4;i++){const y=b.t+b.h*(1-i/4);el(s,'line',{x1:b.l,x2:b.l+b.w,y1:y,y2:y,class:'axis'});el(s,'text',{x:55,y:y+4,'text-anchor':'end'},fmt(maxY*i/4,maxY<25?1:0));const x=b.l+b.w*i/4;el(s,'text',{x,y:h-33,'text-anchor':'middle'},fmt(minX+(maxX-minX)*i/4,maxX<100?1:0))}el(s,'text',{x:555,y:h-5,'text-anchor':'middle'},xLabel);el(s,'text',{x:10,y:14},yLabel);return {s,x:n=>b.l+(n-minX)/(maxX-minX)*b.w,y:n=>b.t+b.h*(1-n/maxY),b}}
+function bars(id,key,target){const rows=short.filter(c=>c.status==='ok'&&measurement(c));const s=$(id);s.replaceChildren();const h=rows.length*31+40,max=Math.max(target,...rows.map(c=>measurement(c)[key]))*1.16;s.setAttribute('viewBox',`0 0 630 ${h}`);const x=v=>215+v/max*345;rows.forEach((c,i)=>{const y=24+i*31,v=measurement(c)[key];el(s,'text',{x:205,y:y+13,'text-anchor':'end'},label(c));const r=el(s,'rect',{x:215,y,width:v/max*345,height:20,rx:3,fill:color(c)});title(r,`${label(c)}: ${fmt(v,3)} tokens/s, ${phase(c)} request`);el(s,'text',{x:x(v)+6,y:y+14},fmt(v,1))});el(s,'line',{x1:x(target),x2:x(target),y1:18,y2:h-15,class:'target'});el(s,'text',{x:x(target),y:12,'text-anchor':'middle'},`${target} t/s`)}
+function drawLong(){const rows=long.filter(c=>selected.has(c.id)),refs=$('prefillRefs').checked;const ymax=Math.max(18,...rows.flatMap(c=>c.decode_intervals.map(i=>i.tokens_per_second)),...(refs?rows.map(c=>measurement(c).prompt_per_second):[]))*1.08;const a=axes('sustained',20480,ymax,'Generated output tokens','Tokens / second',370);el(a.s,'line',{x1:a.x(0),x2:a.x(20480),y1:a.y(13),y2:a.y(13),class:'target'});el(a.s,'text',{x:a.x(20480),y:a.y(13)-5,'text-anchor':'end'},'13 t/s target');for(const c of rows){const col=color(c);el(a.s,'polyline',{points:c.decode_intervals.map(i=>`${a.x(i.token_end)},${a.y(i.tokens_per_second)}`).join(' '),fill:'none',stroke:col,'stroke-width':2.4});for(const i of c.decode_intervals){const p=el(a.s,'circle',{cx:a.x(i.token_end),cy:a.y(i.tokens_per_second),r:3.5,fill:col});title(p,`${label(c)} | tokens ${i.token_start}-${i.token_end}: ${fmt(i.tokens_per_second,3)} t/s`)}if(refs){const p=measurement(c).prompt_per_second;const line=el(a.s,'line',{x1:a.x(0),x2:a.x(20480),y1:a.y(p),y2:a.y(p),stroke:col,'stroke-dasharray':'5 6','stroke-width':1.2});title(line,`${label(c)}: initial prefill ${fmt(p,3)} t/s, measured once`)}}}
+function drawResources(){const suite=$('memorySuite').value,key=$('memory').value;const rows=D.cases.filter(c=>c.suite===suite&&c.status==='ok'&&measurement(c)&&Number.isFinite(c.usage[key]));const maxX=Math.max(1,...rows.map(c=>c.usage[key]/1024))*1.08,maxY=Math.max(13,...rows.map(c=>measurement(c).predicted_per_second))*1.15;const minX=rows.length?Math.max(0,Math.floor(Math.min(...rows.map(c=>c.usage[key]/1024))*0.97*10)/10):0;const a=axes('resources',maxX,maxY,key==='peak_gpu_used_mib'?'Peak device usage (GiB)':'Peak process working set (GiB)','Decode tokens / second',320,minX);if(!rows.length){el(a.s,'text',{x:550,y:150,'text-anchor':'middle'},'No measurements');return}rows.forEach(c=>{const p=el(a.s,'circle',{cx:a.x(c.usage[key]/1024),cy:a.y(measurement(c).predicted_per_second),r:6,fill:color(c),stroke:'#0b1220','stroke-width':1});title(p,`${label(c)}: ${fmt(c.usage[key]/1024,3)} GiB, ${fmt(measurement(c).predicted_per_second,3)} t/s`)})}
+function table(){const q=$('search').value.toLowerCase(),suite=$('suite').value;const rows=D.cases.filter(c=>(suite==='all'||c.suite===suite)&&`${label(c)} ${c.id} ${c.checkpoint} ${c.suite}`.toLowerCase().includes(q));$('visibleCount').textContent=`${rows.length} / ${D.cases.length} variants`;$('rows').innerHTML=rows.map(c=>{const m=measurement(c),cfg=c.config,u=c.usage,cp=checkpoint(c.checkpoint);return `<tr><td>${esc(label(c))}<small>${esc(c.suite)} / ${esc(phase(c))} / MTP ${cfg.mtp_tokens}</small><code title="${cp.hash}">${cp.hash.slice(0,10)}</code></td><td>${cfg.microbatch}</td><td>${cfg.expert_slots} / ${cfg.resident_experts}</td><td>${cfg.expert_slots?cfg.expert_inserts:0} / ${cfg.expert_staging}</td><td>${fmt(cfg.arena_mib,0)}</td><td>${m?fmt(m.prompt_n,0)+' / '+fmt(m.predicted_n,0):'\u2014'}</td><td>${fmt(m?.prompt_per_second)}</td><td>${fmt(m?.predicted_per_second)}</td><td>${fmt(c.decode_intervals.at(-1)?.tokens_per_second)}</td><td>${fmt(u.peak_gpu_used_mib===null?null:u.peak_gpu_used_mib/1024,3)}</td><td>${fmt(u.peak_process_rss_mib===null?null:u.peak_process_rss_mib/1024,3)}</td><td>${fmt(u.steady_wddm_shared_mib===null?null:u.steady_wddm_shared_mib/1024,2)}</td><td>${fmt(c.expert_cache?.hit_rate,1)}</td><td>${fmt(m?.draft_n?100*m.draft_n_accepted/m.draft_n:null,1)}</td><td class="status ${c.status}">${c.status==='ok'?'Complete':esc(c.failure)}</td></tr>`}).join('')}
+$('counts').textContent=`${D.cases.length} variants / ${D.cases.filter(c=>c.status==='ok').length} completed / ${D.cases.filter(c=>c.status!=='ok').length} failed attempts`;
+const cpu=short.find(c=>c.config.cpu_only).measurements.find(m=>m.phase==='warm'),bestPP=Math.max(...short.filter(c=>c.status==='ok').map(c=>c.measurements.find(m=>m.phase==='warm').prompt_per_second)),resident=long.find(c=>c.config.sparse_resident_kv),before=long.find(c=>c.config.expert_slots===54&&!c.config.sparse_resident_kv),afterMetric=measurement(resident),beforeMetric=measurement(before),gain=100*(afterMetric.predicted_per_second/beforeMetric.predicted_per_second-1);
+$('cards').innerHTML=[['CPU baseline decode',fmt(cpu.predicted_per_second)+' t/s','Warm short test / 13 decode threads'],['Best warm prefill',fmt(bestPP)+' t/s','Short sweep / u2048 / 8192 MiB arena'],['Best sustained decode',fmt(afterMetric.predicted_per_second)+' t/s','Fiction-scifi / 54 slots / resident KV'],['Observed resident-KV gain','+'+fmt(gain,1)+'%','Same configuration; one run per implementation']].map(([a,b,c])=>`<div class="card"><span class="caption">${a}</span><strong>${b}</strong><small>${c}</small></div>`).join('');
+$('checkpoints').innerHTML=D.checkpoints.map(c=>`<div class="checkpoint"><h3>${esc(c.title)}</h3><code title="${c.hash}">${c.hash.slice(0,10)}</code><p>${esc(c.detail)}</p></div>`).join('');
+$('improvement').innerHTML=`<strong>54 slots / 1 insert / 1 staging:</strong> average decode ${fmt(beforeMetric.predicted_per_second)} to ${fmt(afterMetric.predicted_per_second)} t/s (+${fmt(gain,1)}%). Final interval ${fmt(before.decode_intervals.at(-1).tokens_per_second)} to ${fmt(resident.decode_intervals.at(-1).tokens_per_second)} t/s. Peak GPU ${fmt(before.usage.peak_gpu_used_mib,0)} to ${fmt(resident.usage.peak_gpu_used_mib,0)} MiB.<p class="caption">Generated sequences first differ at token 1,779. This is a single-run observation, with 256K configured capacity and approximately 20.8K actual history.</p>`;
+$('notes').innerHTML=D.notes.map(n=>`<li>${esc(n)}</li>`).join('');
+for(const c of long){const l=document.createElement('label'),i=document.createElement('input');i.type='checkbox';i.checked=true;i.dataset.case=c.id;i.onchange=()=>{i.checked?selected.add(c.id):selected.delete(c.id);drawLong()};l.append(i);const span=document.createElement('span');span.style.color=color(c);span.textContent=`e${c.config.expert_slots} / i${c.config.expert_inserts} / s${c.config.expert_staging}${c.config.sparse_resident_kv?' / resident KV':''}`;l.append(span);$('legend').append(l)}
+function selectCurves(only54){for(const input of $('legend').querySelectorAll('input')){const c=long.find(c=>c.id===input.dataset.case);input.checked=!only54||c.config.expert_slots===54;input.checked?selected.add(c.id):selected.delete(c.id)}drawLong()}
+$('allCurves').onclick=()=>selectCurves(false);$('compareCurves').onclick=()=>selectCurves(true);$('prefillRefs').onchange=drawLong;$('phase').onchange=()=>{bars('prefill','prompt_per_second',200);bars('decode','predicted_per_second',13);table();drawResources()};$('memory').onchange=drawResources;$('memorySuite').onchange=drawResources;$('suite').onchange=table;$('search').oninput=table;
+bars('prefill','prompt_per_second',200);bars('decode','predicted_per_second',13);drawLong();drawResources();table();
+</script></body></html>
