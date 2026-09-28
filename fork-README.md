@@ -6,7 +6,7 @@ One fixed CUDA arena is shared between prefill compute workspace and decode KV r
 
 ## Results
 
-The [combined benchmark report](fork-test/index.html) and [sanitized JSON](fork-test/data.json) cover all 24 variants: CPU baseline, microbatch, expert slots, insertion/staging limits, MTP, and fiction-scifi generation. The report includes throughput curves, memory peaks, failures, and checkpoint attribution; open it with its accompanying stylesheet.
+The [overall benchmark report](fork-test/index.html) and [sanitized JSON](fork-test/data.json) cover the IQ4_XS CPU/GPU sweeps, llama.cpp Q2, and Strata Q2 comparisons. Filter by engine/model to compare token and elapsed-time curves, memory peaks, sampling, expert slots, MTP/lookup settings, failures, and output-quality warnings. Keep the accompanying stylesheet beside the HTML. Quantization, KV formats, and draft policies differ between some variants.
 
 The best measured sustained configuration uses **54 expert slots, 1 insertion, and 1 staging slot**. With resident KV, average decode increased from **13.57 to 14.52 tokens/s**, with **15,776 MiB** peak total GPU usage on an RTX 5080 with IQ4_XS model weights. These are single-run observations with differing generated sequences. Context capacity was 262144 Q8 tokens; actual history reached about 20.8K tokens, so this is not a full-context throughput result.
 
@@ -56,6 +56,7 @@ Additional integration fixes adapt Inovello's duplicate-ID handling, Xiang Chang
 ## Scope and validation
 
 - Hot-expert caching currently handles batches of up to eight tokens; normal prefill uses the ordinary expert path. Adding slots alone does not accelerate large-batch prefill.
-- Streaming KV currently requires single-token generation. MTP is available with native KV, but the configuration above disables it. Use one target model per process; the expert cache remains a singleton.
+- Local speculative-streaming changes support multi-token target verification with DFlash2 and MTP. The decode arena reserves verification workspace while retaining resident KV and asynchronous transfers; larger verification batches use the prefill layout. Draft weights and KV remain separate allocations. Qwen38-27B was checked with three draft tokens, rejection, and prefix reuse beyond resident capacity. Qwen4Exp has CUDA sparse-attention coverage, but no end-to-end speculative model validation. See the [dense-model benchmark](fork-test-qwen38-27b/index.html) for measured configurations.
+- Use one target model per process; the expert cache remains a singleton. The startup example disables speculation.
 - The arena must fit the selected microbatch's compute workspace plus streaming buffers. Expert-cache memory is not included in automatic fit accounting, so the example disables auto-fit. A larger cache is not always faster.
-- Validation includes 953 CUDA expert-operation cases and six KV-streaming suites, with 616 attention assertions covering partial/full residency, changing writes, graph replay, layout changes, and cache replacement. Benchmark results are performance measurements, not a model-quality evaluation.
+- Validation includes 953 CUDA expert-operation cases and six KV-streaming suites. The expanded attention suite passes 727 assertions, including one-to-four-token verification, per-query sparse masks, partial/full residency, changing writes, graph replay, layout changes, and cache replacement. Benchmark results are performance measurements, not a model-quality evaluation.
