@@ -314,19 +314,19 @@ std::vector<float> run_attention_layers(
         current.mask = ggml_new_tensor_4d(
             compute_ctx.get(), GGML_TYPE_F16, n_kv, n_batch, 1, 1);
         current.k_storage = ggml_new_tensor_2d(
-            kv_ctx.get(), GGML_TYPE_Q8_0, HEAD_DIM*N_KV_HEAD, n_kv);
+            kv_ctx.get(), layers[layer].type_k, HEAD_DIM*N_KV_HEAD, n_kv);
         current.v_storage = ggml_new_tensor_2d(
-            kv_ctx.get(), GGML_TYPE_Q4_0, HEAD_DIM*N_KV_HEAD, n_kv);
+            kv_ctx.get(), layers[layer].type_v, HEAD_DIM*N_KV_HEAD, n_kv);
         ggml_tensor * k_cache = ggml_view_4d(
             kv_ctx.get(), current.k_storage, HEAD_DIM, N_KV_HEAD, n_kv, 1,
-            ggml_row_size(GGML_TYPE_Q8_0, HEAD_DIM),
-            ggml_row_size(GGML_TYPE_Q8_0, HEAD_DIM*N_KV_HEAD),
-            ggml_row_size(GGML_TYPE_Q8_0, HEAD_DIM*N_KV_HEAD)*n_kv, 0);
+            ggml_row_size(layers[layer].type_k, HEAD_DIM),
+            ggml_row_size(layers[layer].type_k, HEAD_DIM*N_KV_HEAD),
+            ggml_row_size(layers[layer].type_k, HEAD_DIM*N_KV_HEAD)*n_kv, 0);
         ggml_tensor * v_cache = ggml_view_4d(
             kv_ctx.get(), current.v_storage, HEAD_DIM, N_KV_HEAD, n_kv, 1,
-            ggml_row_size(GGML_TYPE_Q4_0, HEAD_DIM),
-            ggml_row_size(GGML_TYPE_Q4_0, HEAD_DIM*N_KV_HEAD),
-            ggml_row_size(GGML_TYPE_Q4_0, HEAD_DIM*N_KV_HEAD)*n_kv, 0);
+            ggml_row_size(layers[layer].type_v, HEAD_DIM),
+            ggml_row_size(layers[layer].type_v, HEAD_DIM*N_KV_HEAD),
+            ggml_row_size(layers[layer].type_v, HEAD_DIM*N_KV_HEAD)*n_kv, 0);
         ggml_tensor * k = ggml_permute(kv_ctx.get(), k_cache, 0, 2, 1, 3);
         ggml_tensor * v = ggml_permute(kv_ctx.get(), v_cache, 0, 2, 1, 3);
 
@@ -414,8 +414,11 @@ std::vector<float> run_attention_layers(
 
 } // namespace
 
-int main() {
+int main(int argc, char ** argv) {
     testing t;
+    if (argc > 1) {
+        t.set_filter(argv[1]);
+    }
 
     t.test("qwen4exp sparse masks preserve streamed Q8 attention", [](testing & t) {
         N_KV_HEAD = 2;
@@ -425,7 +428,7 @@ int main() {
             return;
         }
         constexpr int64_t n_kv = 262144;
-        for (int64_t n_batch : {int64_t(1), int64_t(17)}) {
+        for (int64_t n_batch : {int64_t(1), int64_t(2), int64_t(3), int64_t(4), int64_t(17)}) {
             auto inputs = make_inputs(n_kv, n_batch, n_kv - n_batch, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0);
             for (int64_t batch = 0; batch < n_batch; ++batch) {
                 for (int64_t token = 0; token < n_kv; ++token) {
@@ -434,11 +437,35 @@ int main() {
                     }
                 }
             }
+            std::vector<int64_t> selected;
+            for (int64_t token = 0; token < n_kv; ++token) {
+                for (int64_t query = 0; query < n_batch; ++query) {
+                    if (std::isfinite(ggml_fp16_to_fp32(inputs.mask[query*n_kv + token]))) {
+                        selected.push_back(token);
+                        break;
+                    }
+                }
+            }
+            const int64_t compact_tokens = GGML_PAD(std::min<int64_t>(n_kv, n_batch*1024), 256);
+            auto compact_inputs = make_inputs(compact_tokens, n_batch, 0, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0);
+            compact_inputs.q = inputs.q;
+            std::fill(compact_inputs.mask.begin(), compact_inputs.mask.end(), ggml_fp32_to_fp16(-INFINITY));
+            const size_t row_bytes = ggml_row_size(GGML_TYPE_Q8_0, HEAD_DIM)*N_KV_HEAD;
+            for (size_t row = 0; row < selected.size(); ++row) {
+                std::memcpy(compact_inputs.k.data() + row*row_bytes, inputs.k.data() + selected[row]*row_bytes, row_bytes);
+                std::memcpy(compact_inputs.v.data() + row*row_bytes, inputs.v.data() + selected[row]*row_bytes, row_bytes);
+                for (int64_t query = 0; query < n_batch; ++query) {
+                    compact_inputs.mask[query*compact_tokens + row] = inputs.mask[query*n_kv + selected[row]];
+                }
+            }
             for (int resident_pages : {0, 2, 1024}) {
                 for (bool replace_cache : {false, true}) {
                     const auto expected = run_attention(backend.get(), inputs,
                         ggml_backend_get_default_buffer_type(backend.get()), n_kv, n_batch,
-                        4, 1, n_batch == 1, GGML_TYPE_I64, false, nullptr, true, replace_cache, 0, 1024);
+                        4, 1, n_batch <= 4, GGML_TYPE_I64, false, nullptr, true, replace_cache, 0, 0);
+                    const auto compact_expected = run_attention(backend.get(), compact_inputs,
+                        ggml_backend_get_default_buffer_type(backend.get()), compact_tokens, n_batch,
+                        4, 1, n_batch <= 4, GGML_TYPE_I64, false, nullptr, true, replace_cache);
                     ggml_backend_cuda_kv_stream_params params{};
                     params.device = 0;
                     params.stage_bytes = 2*ggml_row_size(GGML_TYPE_Q8_0, HEAD_DIM)*N_KV_HEAD*256;
@@ -454,7 +481,7 @@ int main() {
                     }
                     const auto actual = run_attention(backend.get(), inputs,
                         ggml_backend_cuda_kv_stream_buffer_type(runtime), n_kv, n_batch,
-                        4, 1, n_batch == 1, GGML_TYPE_I64, false, resident_pages > 0 ? runtime : nullptr, true, replace_cache,
+                        4, 1, n_batch <= 4, GGML_TYPE_I64, false, resident_pages > 0 ? runtime : nullptr, true, replace_cache,
                         9000 + resident_pages + int(replace_cache), 1024, resident_pages == 1024 && replace_cache);
                     const auto stats = ggml_backend_cuda_kv_stream_get_stats(runtime);
                     ggml_backend_cuda_kv_stream_runtime_free(runtime);
@@ -472,15 +499,22 @@ int main() {
                         break;
                     }
                     float max_abs = 0.0f;
+                    float compact_max_abs = 0.0f;
                     bool finite = true;
                     for (size_t i = 0; i < actual.size(); ++i) {
                         finite = finite && std::isfinite(actual[i]) && std::isfinite(expected[i]);
                         max_abs = std::max(max_abs, std::abs(expected[i] - actual[i]));
+                        compact_max_abs = std::max(compact_max_abs, std::abs(compact_expected[i] - actual[i]));
                     }
                     std::fprintf(stderr, "sparse batch=%lld resident=%d replace=%d max_abs=%g uploads=%llu bytes=%llu\n",
                         (long long) n_batch, resident_pages, int(replace_cache), max_abs,
                         (unsigned long long) stats.resident_misses, (unsigned long long) stats.host_to_device_bytes);
-                    t.assert_true("sparse outputs are finite and equivalent", finite && max_abs <= 5e-4f);
+                    // Dense and compact kernels use different reduction and rounding paths.
+                    t.assert_true("sparse outputs match dense attention", finite && max_abs <= 1e-3f);
+                    if (n_batch <= 8) {
+                        std::fprintf(stderr, "compact reference max_abs=%g\n", compact_max_abs);
+                        t.assert_true("sparse gather matches host compaction", finite && compact_max_abs <= 5e-4f);
+                    }
                 }
             }
         }
@@ -807,7 +841,7 @@ int main() {
         t.assert_true("streamed output is numerically equivalent", max_abs <= 3e-4f);
     });
 
-    t.test("one-page causal prefill stays bit-identical to ordinary CUDA attention", [](testing & t) {
+    t.test("one-page verification remains equivalent to ordinary CUDA attention", [](testing & t) {
         constexpr int64_t n_kv = 256;
         constexpr int64_t n_batch = 5;
         ggml_backend_ptr backend(ggml_backend_cuda_init(0));
@@ -838,10 +872,17 @@ int main() {
 
         t.assert_equal(uint64_t(0), stats.staged_set_rows);
         t.assert_equal(expected.size(), actual.size());
-        t.assert_true("one-page outputs are bit-identical", expected == actual);
+        float max_abs = 0.0f;
+        bool finite = true;
+        for (size_t i = 0; i < actual.size(); ++i) {
+            finite = finite && std::isfinite(actual[i]);
+            max_abs = std::max(max_abs, std::abs(expected[i] - actual[i]));
+        }
+        std::fprintf(stderr, "verification direct-quantized max_abs=%g\n", max_abs);
+        t.assert_true("one-page verification stays within quantized-kernel tolerance", finite && max_abs <= 3e-4f);
     });
 
-    t.test("fully resident multi-page prefill stays bit-identical to ordinary CUDA attention", [](testing & t) {
+    t.test("fully resident multi-page verification remains equivalent to ordinary CUDA attention", [](testing & t) {
         constexpr int64_t n_kv = 512;
         constexpr int64_t n_batch = 4;
         ggml_backend_ptr backend(ggml_backend_cuda_init(0));
@@ -875,7 +916,14 @@ int main() {
 
         t.assert_equal(uint64_t(0), stats.streamed_pages);
         t.assert_equal(expected.size(), actual.size());
-        t.assert_true("fully resident outputs are bit-identical", expected == actual);
+        float max_abs = 0.0f;
+        bool finite = true;
+        for (size_t i = 0; i < actual.size(); ++i) {
+            finite = finite && std::isfinite(actual[i]);
+            max_abs = std::max(max_abs, std::abs(expected[i] - actual[i]));
+        }
+        std::fprintf(stderr, "verification direct-quantized max_abs=%g\n", max_abs);
+        t.assert_true("resident verification stays within quantized-kernel tolerance", finite && max_abs <= 3e-4f);
     });
 
     t.test("four-query page-boundary prefill remains finite and equivalent", [](testing & t) {
@@ -1573,66 +1621,69 @@ int main() {
     });
 
 
-    t.test("decode layout spreads an oversized streamed deficit across enough layers", [](testing & t) {
-        constexpr int64_t n_kv = 768;
-        constexpr int64_t n_batch = 1;
-        ggml_backend_ptr backend(ggml_backend_cuda_init(0));
-        if (!t.assert_true("CUDA backend initializes", backend != nullptr)) {
-            return;
-        }
+    for (int64_t n_batch : { 1, 2, 3, 4 }) {
+        t.test("decode layout supports speculative verification widths", [n_batch](testing & t) {
+            constexpr int64_t n_kv = 768;
+            ggml_backend_ptr backend(ggml_backend_cuda_init(0));
+            if (!t.assert_true("CUDA backend initializes", backend != nullptr)) {
+                return;
+            }
 
-        std::vector<attention_inputs> inputs{
-            make_inputs(n_kv, n_batch, n_kv - 1),
-            make_inputs(n_kv, n_batch, n_kv - 1),
-            make_inputs(n_kv, n_batch, n_kv - 1),
-            make_inputs(n_kv, n_batch, n_kv - 1),
-        };
-        const std::vector<float> expected = run_attention_layers(
-            backend.get(), inputs, ggml_backend_get_default_buffer_type(backend.get()), n_kv, n_batch);
+            std::vector<attention_inputs> inputs{
+                make_inputs(n_kv, n_batch, n_kv - n_batch, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0),
+                make_inputs(n_kv, n_batch, n_kv - n_batch, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0),
+                make_inputs(n_kv, n_batch, n_kv - n_batch, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0),
+                make_inputs(n_kv, n_batch, n_kv - n_batch, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0),
+            };
+            std::fprintf(stderr, "verification width=%lld native\n", (long long) n_batch);
+            const std::vector<float> expected = run_attention_layers(
+                backend.get(), inputs, ggml_backend_get_default_buffer_type(backend.get()), n_kv, n_batch);
 
-        const size_t k_page_bytes = ggml_row_size(GGML_TYPE_Q8_0, HEAD_DIM)*N_KV_HEAD*256;
-        const size_t v_page_bytes = ggml_row_size(GGML_TYPE_Q4_0, HEAD_DIM)*N_KV_HEAD*256;
-        const size_t page_bytes = align_up(k_page_bytes, 128) + v_page_bytes;
-        ggml_backend_cuda_kv_stream_params params{};
-        params.device               = 0;
-        params.stage_bytes          = page_bytes;
-        params.stage_slots          = 8;
-        params.pool_bytes           = 12*page_bytes;
-        params.resident_layer_count = 4;
-        params.page_tokens          = 256;
-        auto runtime = ggml_backend_cuda_kv_stream_runtime_new(params);
-        if (!t.assert_true("shared runtime initializes", runtime != nullptr)) {
-            return;
-        }
+            const size_t k_page_bytes = ggml_row_size(GGML_TYPE_Q8_0, HEAD_DIM)*N_KV_HEAD*256;
+            const size_t v_page_bytes = ggml_row_size(GGML_TYPE_Q8_0, HEAD_DIM)*N_KV_HEAD*256;
+            const size_t page_bytes = align_up(k_page_bytes, 128) + v_page_bytes;
+            ggml_backend_cuda_kv_stream_params params{};
+            params.device               = 0;
+            params.stage_bytes          = page_bytes;
+            params.stage_slots          = 8;
+            params.pool_bytes           = 12*page_bytes;
+            params.resident_layer_count = 4;
+            params.page_tokens          = 256;
+            auto runtime = ggml_backend_cuda_kv_stream_runtime_new(params);
+            if (!t.assert_true("shared runtime initializes", runtime != nullptr)) {
+                return;
+            }
 
-        // Four layers with three active pages and one uniformly resident page
-        // have an eight-page streamed deficit. An eight-slot ring can hold the
-        // entire deficit, but one layer contains only three pages, so the layout
-        // must distribute the deficit over at least ceil(8/3) layers.
-        if (!t.assert_true("decode layout respects per-layer active-page capacity",
-                ggml_backend_cuda_kv_stream_set_decode_layout(runtime, 3))) {
+            // Four layers with three active pages and one uniformly resident page
+            // have an eight-page streamed deficit. An eight-slot ring can hold the
+            // entire deficit, but one layer contains only three pages, so the layout
+            // must distribute the deficit over at least ceil(8/3) layers.
+            if (!t.assert_true("decode layout respects per-layer active-page capacity",
+                    ggml_backend_cuda_kv_stream_set_decode_layout(runtime, 3))) {
+                ggml_backend_cuda_kv_stream_runtime_free(runtime);
+                return;
+            }
+
+            std::fprintf(stderr, "verification width=%lld streamed\n", (long long) n_batch);
+            const std::vector<float> actual = run_attention_layers(
+                backend.get(), inputs, ggml_backend_cuda_kv_stream_buffer_type(runtime),
+                n_kv, n_batch, 1, 1, GGML_TYPE_I32, runtime);
+            const auto stats = ggml_backend_cuda_kv_stream_get_stats(runtime);
             ggml_backend_cuda_kv_stream_runtime_free(runtime);
-            return;
-        }
 
-        const std::vector<float> actual = run_attention_layers(
-            backend.get(), inputs, ggml_backend_cuda_kv_stream_buffer_type(runtime),
-            n_kv, n_batch, 1, 1, GGML_TYPE_I32, runtime);
-        const auto stats = ggml_backend_cuda_kv_stream_get_stats(runtime);
-        ggml_backend_cuda_kv_stream_runtime_free(runtime);
-
-        t.assert_equal(uint64_t(8), stats.streamed_pages);
-        t.assert_equal(uint64_t(4), stats.resident_pages_attended);
-        if (!t.assert_equal(expected.size(), actual.size())) {
-            return;
-        }
-        float max_abs = 0.0f;
-        for (size_t i = 0; i < expected.size(); ++i) {
-            max_abs = std::max(max_abs, std::abs(expected[i] - actual[i]));
-        }
-        std::fprintf(stderr, "oversized-ring decode max_abs=%g\n", max_abs);
-        t.assert_true("oversized-ring decode remains equivalent", max_abs <= 3e-4f);
-    });
+            t.assert_equal(uint64_t(8), stats.streamed_pages);
+            t.assert_equal(uint64_t(4), stats.resident_pages_attended);
+            if (!t.assert_equal(expected.size(), actual.size())) {
+                return;
+            }
+            float max_abs = 0.0f;
+            for (size_t i = 0; i < expected.size(); ++i) {
+                max_abs = std::max(max_abs, std::abs(expected[i] - actual[i]));
+            }
+            std::fprintf(stderr, "oversized-ring decode max_abs=%g\n", max_abs);
+            t.assert_true("oversized-ring decode remains equivalent", max_abs <= 3e-4f);
+        });
+    }
 
     t.test("decode layout bounds layer concentration by the transfer ring", [](testing & t) {
         constexpr int64_t n_kv = 768;

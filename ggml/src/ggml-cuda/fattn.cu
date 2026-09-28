@@ -1660,7 +1660,7 @@ void ggml_cuda_kv_stream_graph_begin(ggml_cuda_kv_stream_transfer_ring * ring) {
 
 static bool kv_stream_sparse_decode(const ggml_tensor * dst) {
     const int32_t n_kv_max = ggml_get_op_params_i32(dst, 4);
-    return dst->src[0]->ne[1] == 1 && dst->src[3] != nullptr &&
+    return dst->src[0]->ne[1] <= 8 && dst->src[3] != nullptr &&
         dst->src[3]->ne[2] == 1 && dst->src[3]->ne[3] == 1 &&
         n_kv_max > 0 && n_kv_max < dst->src[1]->ne[1] &&
         kv_stream_resolve_native_partial(dst->src[1]->type, dst->src[2]->type) != nullptr;
@@ -1680,8 +1680,9 @@ bool ggml_cuda_kv_stream_graph_add_attention(
     if (ring->graph_resident_cache != nullptr && ring->graph_resident_cache != resident_cache) {
         return false;
     }
-    ring->graph_decode = ring->graph_decode && dst->src[0]->ne[1] == 1;
-    if (dst->src[0]->ne[1] != 1) {
+    const bool decode = dst->src[0]->ne[1] <= 32;
+    ring->graph_decode = ring->graph_decode && decode;
+    if (!decode) {
         // Graphs are rebuilt across warmup, prompt chunks, and slot reuse.
         // Relearn pointer-to-layer identity once per prefill graph while the
         // resident page contents are refreshed by the local multi-token path.
@@ -1809,7 +1810,7 @@ uint32_t ggml_cuda_kv_stream_last_ring_peak_occupancy(
 static __global__ void kv_stream_gather_sparse_rows(
         const char * k, const char * v, const half * mask, const int32_t * indices,
         char * out_k, char * out_v, half * out_mask,
-        size_t k_stride, size_t v_stride, int n_tokens,
+        size_t k_stride, size_t v_stride, int n_tokens, int64_t mask_stride,
         const char * resident_k, const char * resident_v, int64_t resident_tokens) {
     ggml_cuda_pdl_sync();
     const int row = blockIdx.x;
@@ -1821,14 +1822,16 @@ static __global__ void kv_stream_gather_sparse_rows(
         k = resident_k;
         v = resident_v;
     }
-    for (size_t i = threadIdx.x; i < k_stride; i += blockDim.x) {
-        out_k[row*k_stride + i] = token >= 0 ? k[size_t(token)*k_stride + i] : 0;
-    }
-    for (size_t i = threadIdx.x; i < v_stride; i += blockDim.x) {
-        out_v[row*v_stride + i] = token >= 0 ? v[size_t(token)*v_stride + i] : 0;
+    if (blockIdx.y == 0) {
+        for (size_t i = threadIdx.x; i < k_stride; i += blockDim.x) {
+            out_k[row*k_stride + i] = token >= 0 ? k[size_t(token)*k_stride + i] : 0;
+        }
+        for (size_t i = threadIdx.x; i < v_stride; i += blockDim.x) {
+            out_v[row*v_stride + i] = token >= 0 ? v[size_t(token)*v_stride + i] : 0;
+        }
     }
     if (threadIdx.x == 0) {
-        out_mask[row] = token >= 0 ? mask[token] : __float2half(-INFINITY);
+        out_mask[blockIdx.y*n_tokens + row] = token >= 0 ? mask[blockIdx.y*mask_stride + token] : __float2half(-INFINITY);
     }
     ggml_cuda_pdl_lc();
 }
@@ -1874,22 +1877,24 @@ static void kv_stream_sparse_attention(
             ring->host_to_device_copy_commands += 2;
         }
     }
-    const int32_t n_tokens = GGML_PAD(ggml_get_op_params_i32(dst, 4), FATTN_KQ_STRIDE);
+    const int32_t n_queries = dst->src[0]->ne[1];
+    const int32_t n_tokens = GGML_PAD(std::min<int64_t>(k->ne[1], int64_t(n_queries)*ggml_get_op_params_i32(dst, 4)), FATTN_KQ_STRIDE);
     ggml_cuda_pool_alloc<int32_t> indices(ctx.pool(), n_tokens + 1);
     ggml_cuda_pool_alloc<char> compact_k(ctx.pool(), size_t(n_tokens)*k->nb[1]);
     ggml_cuda_pool_alloc<char> compact_v(ctx.pool(), size_t(n_tokens)*v->nb[1]);
-    ggml_cuda_pool_alloc<half> compact_mask(ctx.pool(), n_tokens);
-    ggml_cuda_flash_attn_ext_compact_mask(mask, indices.ptr, indices.ptr + n_tokens, 1, 1, n_tokens, ctx.stream());
+    ggml_cuda_pool_alloc<half> compact_mask(ctx.pool(), size_t(n_tokens)*n_queries);
+    // Gather the union once; retain each query's causal mask for verification.
+    ggml_cuda_flash_attn_ext_compact_mask(mask, indices.ptr, indices.ptr + n_tokens, n_queries, n_queries == 1 ? 1 : 8, n_tokens, ctx.stream());
 
     cudaPointerAttributes attr_k{}, attr_v{};
     CUDA_CHECK(cudaPointerGetAttributes(&attr_k, k->data));
     CUDA_CHECK(cudaPointerGetAttributes(&attr_v, v->data));
     GGML_ASSERT(attr_k.devicePointer != nullptr && attr_v.devicePointer != nullptr);
-    const ggml_cuda_kernel_launch_params launch_params(dim3(n_tokens), dim3(256), 0, ctx.stream());
+    const ggml_cuda_kernel_launch_params launch_params(dim3(n_tokens, n_queries), dim3(256), 0, ctx.stream());
     ggml_cuda_kernel_launch(kv_stream_gather_sparse_rows, launch_params,
         static_cast<const char *>(attr_k.devicePointer), static_cast<const char *>(attr_v.devicePointer),
         static_cast<const half *>(mask->data), indices.ptr, compact_k.ptr, compact_v.ptr, compact_mask.ptr,
-        k->nb[1], v->nb[1], n_tokens, resident_k, resident_v, resident_tokens);
+        k->nb[1], v->nb[1], n_tokens, mask->nb[1]/sizeof(half), resident_k, resident_v, resident_tokens);
     CUDA_CHECK(cudaGetLastError());
 
     ggml_tensor selected_k = *k;
@@ -1902,14 +1907,23 @@ static void kv_stream_sparse_attention(
     selected_v.nb[3] = size_t(n_tokens)*v->nb[1];
     selected_mask.data = compact_mask.ptr;
     selected_mask.ne[0] = n_tokens;
-    selected_mask.ne[1] = 1;
-    selected_mask.nb[1] = selected_mask.nb[2] = selected_mask.nb[3] = size_t(n_tokens)*sizeof(half);
+    selected_mask.ne[1] = n_queries;
+    selected_mask.nb[1] = size_t(n_tokens)*sizeof(half);
+    selected_mask.nb[2] = selected_mask.nb[3] = selected_mask.nb[1]*n_queries;
     ggml_tensor selected_dst = *dst;
     selected_dst.src[1] = &selected_k;
     selected_dst.src[2] = &selected_v;
     selected_dst.src[3] = &selected_mask;
     ggml_set_op_params_i32(&selected_dst, 4, 0);
-    ggml_cuda_flash_attn_ext(ctx, &selected_dst);
+    if (n_queries == 1) {
+        ggml_cuda_flash_attn_ext(ctx, &selected_dst);
+    } else {
+        // Native conversion scratch is bounded by the gathered union, not the full context.
+        ggml_cuda_pool_alloc<char> scratch(ctx.pool(), ggml_cuda_flash_attn_ext_get_alloc_size(ctx.device, &selected_dst));
+        selected_dst.data = scratch.ptr;
+        ggml_cuda_flash_attn_ext(ctx, &selected_dst);
+        CUDA_CHECK(cudaMemcpyAsync(dst->data, scratch.ptr, ggml_nbytes(dst), cudaMemcpyDeviceToDevice, ctx.stream()));
+    }
 }
 
 void ggml_cuda_flash_attn_ext_streamed(
@@ -1950,7 +1964,7 @@ void ggml_cuda_flash_attn_ext_streamed(
         resident_cache->page_tokens : kv_stream_block_tokens(dst, stage_bytes);
     const int nchunks = (K->ne[1] + block_tokens - 1)/block_tokens;
     const int nrows = ggml_nrows(dst);
-    const uint32_t maximum_streamed_span_pages = Q->ne[1] == 1 ?
+    const uint32_t maximum_streamed_span_pages = Q->ne[1] <= 32 ?
         transfer_ring->graph_decode_span_pages : UINT32_MAX;
 
     struct chunk_descriptor {
@@ -2070,7 +2084,7 @@ void ggml_cuda_flash_attn_ext_streamed(
     }
 
     const bool use_mma_prefill = !convert_to_f16 &&
-        Q->ne[1] > 1 && Q->ne[0] == 256 && V->ne[0] == 256 &&
+        Q->ne[1] > 32 && Q->ne[0] == 256 && V->ne[0] == 256 &&
         mask != nullptr && Q->ne[2] % K->ne[2] == 0;
     const int partial_count = use_mma_prefill ? 1 : kv_stream_parts_per_chunk();
     GGML_ASSERT(partial_count > 0 && partial_count <= KV_STREAM_MAX_PARTS_PER_CHUNK);
@@ -2086,7 +2100,8 @@ void ggml_cuda_flash_attn_ext_streamed(
     ggml_cuda_pool_alloc<float2> meta(pool);
     ggml_cuda_pool_alloc<float> accumulator(pool);
     ggml_cuda_pool_alloc<float2> accumulator_meta(pool);
-    const bool needs_partial_reduction = convert_to_f16 || (!streamed_chunks.empty() && nchunks > 1);
+    const bool verification = Q->ne[1] > 1 && Q->ne[1] <= 32;
+    const bool needs_partial_reduction = verification || convert_to_f16 || (!streamed_chunks.empty() && nchunks > 1);
     if (needs_partial_reduction) {
         parts.alloc(size_t(partial_count)*workspace_elements);
         meta.alloc(size_t(partial_count)*workspace_rows);
@@ -2359,7 +2374,7 @@ void ggml_cuda_flash_attn_ext_streamed(
 
         // Preserve normal CUDA flash attention when the active cache is fully resident or fits in one streamed page.
         // This avoids a partial reduction and keeps logits identical to a non-streamed cache.
-        if (!convert_to_f16 && (streamed_chunks.empty() || nchunks == 1)) {
+        if (!verification && !convert_to_f16 && (streamed_chunks.empty() || nchunks == 1)) {
             ggml_cuda_flash_attn_ext(ctx, &staged_dst);
             if (desc.streamed) {
                 if (graph_planned) {

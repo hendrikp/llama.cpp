@@ -312,6 +312,7 @@ private:
         size_t conversion_bytes = 0;
         uint32_t layer_count = 0;
         uint32_t minimum_ring_slots = 8;
+        uint32_t generation_tokens = 1;
         size_t backend_index = SIZE_MAX;
         size_t max_nodes = 0;
         size_t current_kv_bytes = 0;

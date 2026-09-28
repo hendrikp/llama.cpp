@@ -887,9 +887,9 @@ bool llama_context::kv_stream_switch_phase(
 
     const uint32_t n_seqs = cparams.n_seq_max;
     const uint32_t n_tokens = decode ?
-        n_seqs : std::min(cparams.n_ctx, cparams.n_ubatch);
+        arena.generation_tokens : std::min(cparams.n_ctx, cparams.n_ubatch);
     const uint32_t n_outputs = decode ?
-        n_seqs : std::min(n_tokens, cparams.n_outputs_max);
+        n_tokens : std::min(n_tokens, cparams.n_outputs_max);
     auto * gf = graph_reserve(
         n_tokens, n_seqs, n_outputs, reserve_mctx.get());
     if (gf == nullptr) {
@@ -990,10 +990,18 @@ void llama_context::sched_reserve() {
         const int n_splits_pp = ggml_backend_sched_get_n_splits(sched.get());
         const int n_nodes_pp = ggml_graph_n_nodes(gf_pp);
 
-        auto * gf_tg = graph_reserve(
-            n_seqs, n_seqs, n_seqs, mctx.get(), true, sizes_tg.data());
-        if (gf_tg == nullptr) {
-            throw std::runtime_error("failed to measure compute tg buffers");
+        const uint32_t generation_tokens = std::min({n_tokens, cparams.n_outputs_max, 32u});
+        ggml_cgraph * gf_tg = nullptr;
+        // Verification can stop at any draft position; reserve each supported shape.
+        for (uint32_t count = n_seqs; count <= generation_tokens; count += n_seqs) {
+            std::vector<size_t> sizes(backend_ptrs.size(), 0);
+            gf_tg = graph_reserve(count, n_seqs, count, mctx.get(), true, sizes.data());
+            if (gf_tg == nullptr) {
+                throw std::runtime_error("failed to measure compute tg buffers");
+            }
+            for (size_t i = 0; i < sizes.size(); ++i) {
+                sizes_tg[i] = std::max(sizes_tg[i], sizes[i]);
+            }
         }
         const int n_splits_tg = ggml_backend_sched_get_n_splits(sched.get());
         const int n_nodes_tg = ggml_graph_n_nodes(gf_tg);
@@ -1048,6 +1056,7 @@ void llama_context::sched_reserve() {
             make_layout(plan_tg, std::move(sizes_tg));
         kv_stream_phase_arena.backend_index = backend_index;
         kv_stream_phase_arena.max_nodes = max_nodes;
+        kv_stream_phase_arena.generation_tokens = generation_tokens;
         kv_stream_phase_arena.configured = true;
 
         sched.reset();
@@ -1076,15 +1085,15 @@ void llama_context::sched_reserve() {
             LLAMA_LOG_INFO("%s: graph nodes  = %d\n", __func__, n_nodes_pp);
         } else {
             LLAMA_LOG_INFO(
-                "%s: graph nodes  = %d (with bs=%d), %d (with bs=1)\n",
-                __func__, n_nodes_pp, n_tokens, n_nodes_tg);
+                "%s: graph nodes  = %d (with bs=%d), %d (with bs=%u)\n",
+                __func__, n_nodes_pp, n_tokens, n_nodes_tg, generation_tokens);
         }
         if (n_splits_pp == n_splits_tg) {
             LLAMA_LOG_INFO("%s: graph splits = %d\n", __func__, n_splits_pp);
         } else {
             LLAMA_LOG_INFO(
-                "%s: graph splits = %d (with bs=%d), %d (with bs=1)\n",
-                __func__, n_splits_pp, n_tokens, n_splits_tg);
+                "%s: graph splits = %d (with bs=%d), %d (with bs=%u)\n",
+                __func__, n_splits_pp, n_tokens, n_splits_tg, generation_tokens);
         }
 
         const int64_t t_end_us = ggml_time_us();
@@ -1859,15 +1868,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                 }
                 const bool generation =
                     llama_kv_stream_phase_is_generation(
-                        phase, ubatch.n_tokens);
-                if (kv_stream_phase_arena.configured && generation &&
-                        ubatch.n_tokens != cparams.n_seq_max) {
-                    LLAMA_LOG_ERROR(
-                        "%s: phase arena currently supports TG1 without speculative batches\n",
-                        __func__);
-                    ret = GGML_STATUS_FAILED;
-                    return nullptr;
-                }
+                        phase, ubatch.n_tokens) &&
+                    (!kv_stream_phase_arena.configured ||
+                        ubatch.n_tokens <= kv_stream_phase_arena.generation_tokens);
                 if (!kv_stream_switch_phase(
                         generation, attn_context->get_n_kv())) {
                     LLAMA_LOG_ERROR(

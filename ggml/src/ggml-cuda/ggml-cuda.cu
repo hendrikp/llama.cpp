@@ -991,8 +991,20 @@ static size_t ggml_backend_cuda_buffer_type_get_alignment(ggml_backend_buffer_ty
     GGML_UNUSED(buft);
 }
 
+static bool ggml_backend_buft_is_cuda_kv_stream(ggml_backend_buffer_type_t buft);
+
 static size_t ggml_backend_cuda_buffer_type_get_alloc_size_for_device(
         int device, const ggml_tensor * tensor) {
+    auto streamed = [](const ggml_tensor * t) {
+        const ggml_tensor * storage = t->view_src != nullptr ? t->view_src : t;
+        return storage->buffer != nullptr && ggml_backend_buft_is_cuda_kv_stream(storage->buffer->buft);
+    };
+    if (tensor->op == GGML_OP_FLASH_ATTN_EXT && tensor->src[0]->ne[1] > 1 && tensor->src[0]->ne[1] <= 32 &&
+            streamed(tensor->src[1]) && streamed(tensor->src[2]) &&
+            ggml_backend_cuda_kv_stream_get_attention_mode(tensor->src[1]->type, tensor->src[2]->type) == GGML_BACKEND_CUDA_KV_STREAM_ATTENTION_DIRECT) {
+        // Verification reads quantized KV directly; it has no full-cache F16 conversion buffer.
+        return ggml_nbytes(tensor);
+    }
     size_t size = tensor->op == GGML_OP_FLASH_ATTN_EXT
         ? ggml_cuda_flash_attn_ext_get_alloc_size(device, tensor)
         : ggml_nbytes(tensor);
